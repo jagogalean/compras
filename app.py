@@ -260,7 +260,7 @@ elif opcion_menu == "🤝 Gestión de Proveedores":
         except:
             st.info("No hay proveedores registrados.")
 
-# 3. MAPEADOR DINÁMICO (LOGICA DE INTEGRIDAD CORRELATIVA POR SOLICITACAO)
+# 3. MAPEADOR DINÁMICO (LOGICA DE INTEGRIDAD CORRELAIVA)
 elif opcion_menu == "🗺️ Mapeador Dinámico":
     st.subheader("Carga y Procesamiento de la Planilla Maestro de Compras")
     uploaded_reqs = st.file_uploader("Arrastra el archivo de compras aquí", type=["xlsx", "csv"])
