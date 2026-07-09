@@ -44,11 +44,14 @@ st.markdown("""
 # =====================================================================
 # MOTOR DE BASE DE DATOS EN LA NUBE (CONEXIÓN DIRECTA)
 # =====================================================================
-# REEMPLAZA "TU_CONTRASEÑA_REAL" POR LA CONTRASEÑA DE TU PROYECTO
-SUPABASE_DIRECT_URL = "postgresql://postgres.cotrwpikrtbwqlmbgixq:Rio!Cactus77-Nube*Tren-Limon@aws-1-sa-east-1.pooler.supabase.com:5432/postgres"
-
 def get_db_connection():
-    return psycopg2.connect(SUPABASE_DIRECT_URL)
+    return psycopg2.connect(
+        host="aws-1-sa-east-1.pooler.supabase.com",
+        password="Rio!Cactus77-Nube*Tren-Limon",
+        database="postgres",
+        user="postgres.cotrwpikrtbwqlmbgixq",
+        port="5432"
+    )
 
 def init_db():
     conn = get_db_connection()
