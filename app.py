@@ -42,14 +42,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# MOTOR DE BASE DE DATOS EN LA NUBE (CONEXIÓN DIRECTA EN CADENA LIMPIA)
+# MOTOR DE BASE DE DATOS EN LA NUBE (CONEXIÓN SEGURA MEDIANTE ST.SECRETS)
 # =====================================================================
 def get_db_connection():
-    # Tu contraseña real integrada de forma segura
-    contrasena = "Rio!Cactus77-Nube*Tren-Limon"
-    
-    # Pasamos la URL completa directa a connect sin parámetros separados para evitar el error de port
-    return psycopg2.connect(f"postgresql://postgres.cotrwpikrtbwqlmbgixq:{contrasena}@aws-1-sa-east-1.pooler.supabase.com:5432/postgres")
+    try:
+        # Recuperamos la contraseña de forma ultra segura desde el panel de Streamlit Cloud
+        contrasena = st.secrets["database"]["password"]
+        
+        # Conexión limpia mediante cadena directa
+        return psycopg2.connect(f"postgresql://postgres.cotrwpikrtbwqlmbgixq:{contrasena}@aws-1-sa-east-1.pooler.supabase.com:5432/postgres")
+    except KeyError:
+        st.error("⚠️ Error Crítico: No se encontró la contraseña en el panel de Secrets de Streamlit.")
+        raise
 
 def init_db():
     conn = get_db_connection()
@@ -125,7 +129,7 @@ def init_db():
 try:
     init_db()
 except Exception as e:
-    st.error(f"Error de conexión con Supabase: {e}. Verifica que tu contraseña sea correcta.")
+    st.error(f"Error de conexión con Supabase: {e}. Verifica la configuración en Streamlit.")
 
 # SIMULADOR MOCK DE LLM
 def call_mock_llm(prompt_type, data):
