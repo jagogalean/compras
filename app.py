@@ -335,7 +335,7 @@ elif opcion_menu == "🗺️ Mapeador Dinámico":
                 conn.close()
                 st.success(f"⚡ Sincronización Exitosa: {contador_nuevos} requisiciones nuevas agregadas, {contador_actualizados} estados actualizados por número de requisición.")
 
-# 4. DASHBOARD EJECUTIVO (ALERTAS > 1 MES Y TRATAMIENTO)
+# 4. DASHBOARD EJECUTIVO (CORREGIDO PARA ANALÍTICA CLARA)
 elif opcion_menu == "📊 Dashboard Ejecutivo":
     conn = get_db_connection()
     df_db = pd.read_sql_query("SELECT * FROM requisitions", conn)
@@ -343,59 +343,50 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
     conn.close()
     
     if not df_db.empty:
-        if status_filter:
-            df_db = df_db[df_db['situacao_solici'].isin(status_filter)]
-            
+        # Fusión de datos
         df_db = df_db.merge(df_levels, left_on='aprobador_actual', right_on='approver_email', how='left')
-        df_db['level_name'] = df_db['level_name'].fillna("Nivel No Asignado")
         
-        def clasificar_pedido(row):
-            if str(row['pedido']).strip() in ['0', '0.0', 'NaN', '']:
-                return "Rechazado / Sin OC"
-            return "Con Orden de Compra"
-            
-        df_db['Estado Pedido'] = df_db.apply(clasificar_pedido, axis=1)
-        
+        # Lógica de estados
         hoy = datetime.now().date()
         un_mes_atras = hoy - timedelta(days=30)
         
-        def evaluar_alerta(val):
-            if pd.isna(val): return "Ok"
-            if isinstance(val, str):
-                val_dt = pd.to_datetime(val).date()
-            else:
-                val_dt = val
-            return "⚠️ RETRASADO (>1 Mes)" if val_dt < un_mes_atras else "Ok"
+        def determinar_estado(row):
+            # Estado de retraso
+            fecha_ap = pd.to_datetime(row['data_aprova']).date() if pd.notna(row['data_aprova']) else hoy
+            retraso = "Retrasado" if fecha_ap < un_mes_atras else "A Tiempo"
             
-        df_db['Alerta Gestión'] = df_db['data_aprova'].apply(evaluar_alerta)
+            # Estado de compra
+            compra = "Con OC" if str(row['pedido']).strip() not in ['0', '0.0', 'NaN', ''] else "Sin OC"
+            return f"{retraso} | {compra}"
+
+        df_db['Estado Global'] = df_db.apply(determinar_estado, axis=1)
         
-        kpi1, kpi2, kpi3 = st.columns(3)
-        with kpi1:
-            st.markdown(f'<div class="metric-card"><h4>Total de Requisiciones</h4><h2>{len(df_db)}</h2></div>', unsafe_allow_html=True)
-        with kpi2:
-            st.markdown(f'<div class="metric-card"><h4>Con Orden de Compra</h4><h2>{len(df_db[df_db["Estado Pedido"] == "Con Orden de Compra"])}</h2></div>', unsafe_allow_html=True)
-        with kpi3:
-            st.markdown(f'<div class="metric-card"><h4>Alertas por Retraso Extremo</h4><h2>{len(df_db[df_db["Alerta Gestión"] != "Ok"])}</h2></div>', unsafe_allow_html=True)
-            
-        g1, g2 = st.columns(2)
-        with g1:
-            fig_bar = px.bar(df_db, x='area_name', color='Estado Pedido', title="Estatus de Pedidos por Unidad Organizacional", barmode='group')
-            st.plotly_chart(fig_bar, use_container_width=True)
-        with g2:
-            fig_aprov = px.pie(df_db, names='level_name', title="Distribución de Carga en la Cadena de Aprobación")
-            st.plotly_chart(fig_aprov, use_container_width=True)
-            
-        st.subheader("Vista Operativa Detallada")
+        # KPI Mejorados
+        col1, col2, col3 = st.columns(3)
+        total = len(df_db)
+        con_oc = len(df_db[df_db['pedido'].astype(str).str.strip() != '0'])
+        retrasados = len(df_db[pd.to_datetime(df_db['data_aprova']).dt.date < un_mes_atras])
         
-        def resaltar_alertas(row):
-            if row['Alerta Gestión'] != "Ok":
-                return ['background-color: #FEE2E2; color: #991B1B;'] * len(row)
-            return [''] * len(row)
-            
-        df_ver = df_db[['req_code', 'situacao_solici', 'pedido', 'data_aprova', 'analista_email', 'level_name', 'narrativa_solicitacion', 'Alerta Gestión']]
-        st.dataframe(df_ver.style.apply(resaltar_alertas, axis=1), use_container_width=True)
+        col1.metric("Total Requisiciones", total)
+        col2.metric("Con Orden de Compra", con_oc)
+        col3.metric("Alertas por Retraso", retrasados)
+        
+        st.markdown("---")
+        
+        # Gráfico de barras mejorado: Área vs Estado Global
+        st.subheader("Análisis de Salud Operativa por Área")
+        fig_bar = px.histogram(df_db, x='area_name', color='Estado Global', 
+                               barmode='group', 
+                               title="Distribución de Pedidos: Retraso vs. Estado de OC",
+                               category_orders={"Estado Global": ["A Tiempo | Con OC", "A Tiempo | Sin OC", "Retrasado | Con OC", "Retrasado | Sin OC"]})
+        
+        st.plotly_chart(fig_bar, use_container_width=True)
+        
+        # Tabla detallada
+        st.subheader("Detalle de Casos Críticos")
+        st.dataframe(df_db[['req_code', 'area_name', 'data_aprova', 'Estado Global']], use_container_width=True)
     else:
-        st.info("No hay datos en la nube. Ve al Mapeador Dinámico para procesar tu planilla Excel.")
+        st.info("No hay datos cargados.")
 
 # 5. CUADRO COMPARATIVO
 elif opcion_menu == "⚖️ Cuadro Comparativo":
