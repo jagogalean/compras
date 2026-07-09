@@ -343,50 +343,49 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
     conn.close()
     
     if not df_db.empty:
-        # Fusión de datos
         df_db = df_db.merge(df_levels, left_on='aprobador_actual', right_on='approver_email', how='left')
+        df_db['level_name'] = df_db['level_name'].fillna("Sin Aprobador Asignado")
         
-        # Lógica de estados
+        # 1. Lógica precisa de fechas
         hoy = datetime.now().date()
         un_mes_atras = hoy - timedelta(days=30)
         
-        def determinar_estado(row):
-            # Estado de retraso
-            fecha_ap = pd.to_datetime(row['data_aprova']).date() if pd.notna(row['data_aprova']) else hoy
-            retraso = "Retrasado" if fecha_ap < un_mes_atras else "A Tiempo"
-            
-            # Estado de compra
-            compra = "Con OC" if str(row['pedido']).strip() not in ['0', '0.0', 'NaN', ''] else "Sin OC"
-            return f"{retraso} | {compra}"
-
-        df_db['Estado Global'] = df_db.apply(determinar_estado, axis=1)
+        # Convertir a datetime para asegurar comparaciones correctas
+        df_db['data_aprova_dt'] = pd.to_datetime(df_db['data_aprova']).dt.date
         
-        # KPI Mejorados
-        col1, col2, col3 = st.columns(3)
+        # 2. Cálculo matemático real
         total = len(df_db)
-        con_oc = len(df_db[df_db['pedido'].astype(str).str.strip() != '0'])
-        retrasados = len(df_db[pd.to_datetime(df_db['data_aprova']).dt.date < un_mes_atras])
+        # Requisiciones con OC (excluyendo '0', '0.0', vacíos)
+        con_oc = len(df_db[~df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', ''])])
+        # Retrasos: solo las que NO tienen OC y su fecha de aprobación es antigua
+        retrasados = len(df_db[(df_db['data_aprova_dt'] < un_mes_atras) & (df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', '']))])
         
-        col1.metric("Total Requisiciones", total)
-        col2.metric("Con Orden de Compra", con_oc)
-        col3.metric("Alertas por Retraso", retrasados)
+        # Mostrar KPIs
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total Requisiciones", total)
+        k2.metric("Con Orden de Compra", con_oc)
+        k3.metric("Alertas por Retraso (Sin OC)", retrasados)
         
         st.markdown("---")
         
-        # Gráfico de barras mejorado: Área vs Estado Global
-        st.subheader("Análisis de Salud Operativa por Área")
-        fig_bar = px.histogram(df_db, x='area_name', color='Estado Global', 
-                               barmode='group', 
-                               title="Distribución de Pedidos: Retraso vs. Estado de OC",
-                               category_orders={"Estado Global": ["A Tiempo | Con OC", "A Tiempo | Sin OC", "Retrasado | Con OC", "Retrasado | Sin OC"]})
+        # 3. Gráficos en columnas (No más tortas)
+        g1, g2 = st.columns(2)
         
-        st.plotly_chart(fig_bar, use_container_width=True)
-        
-        # Tabla detallada
-        st.subheader("Detalle de Casos Críticos")
-        st.dataframe(df_db[['req_code', 'area_name', 'data_aprova', 'Estado Global']], use_container_width=True)
+        with g1:
+            fig_area = px.histogram(df_db, x='area_name', color='situacao_solici', 
+                                    title="Estatus de Requisiciones por Área")
+            st.plotly_chart(fig_area, use_container_width=True)
+            
+        with g2:
+            # Gráfico de barras para Aprobadores
+            fig_aprov = px.histogram(df_db, x='level_name', title="Distribución de Carga por Aprobador")
+            fig_aprov.update_layout(xaxis={'categoryorder':'total descending'})
+            st.plotly_chart(fig_aprov, use_container_width=True)
+            
+        st.subheader("Vista Operativa Detallada")
+        st.dataframe(df_db[['req_code', 'area_name', 'data_aprova', 'pedido', 'level_name']], use_container_width=True)
     else:
-        st.info("No hay datos cargados.")
+        st.info("No hay datos en la nube.")
 
 # 5. CUADRO COMPARATIVO
 elif opcion_menu == "⚖️ Cuadro Comparativo":
