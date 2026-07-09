@@ -42,16 +42,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# MOTOR DE BASE DE DATOS EN LA NUBE (CONEXIÓN DIRECTA)
+# MOTOR DE BASE DE DATOS EN LA NUBE (CORRECCIÓN DE SINTAXIS)
 # =====================================================================
 def get_db_connection():
-    return psycopg2.connect(
-        host="aws-1-sa-east-1.pooler.supabase.com",
-        password="Rio!Cactus77-Nube*Tren-Limon",
-        database="postgres",
-        user="postgres.cotrwpikrtbwqlmbgixq",
-        port="5432"
-    )
+    # REEMPLAZA ÚNICAMENTE EL TEXTO TU_CONTRASEÑA_REAL POR LA TUYA
+    contrasena = "Rio!Cactus77-Nube*Tren-Limon"
+    
+    # Construimos la conexión segura uniendo los parámetros de forma limpia
+    conn_string = f"host='aws-1-sa-east-1.pooler.supabase.com' dbname='postgres' user='postgres.cotrwpikrtbwqlmbgixq' password='{contrasena}' port=5432"
+    return psycopg2.connect(conn_string)
 
 def init_db():
     conn = get_db_connection()
@@ -260,7 +259,7 @@ elif opcion_menu == "🤝 Gestión de Proveedores":
         except:
             st.info("No hay proveedores registrados.")
 
-# 3. MAPEADOR DINÁMICO (LOGICA DE INTEGRIDAD CORRELAIVA)
+# 3. MAPEADOR DINÁMICO (LOGICA DE INTEGRIDAD CORRELATIVA)
 elif opcion_menu == "🗺️ Mapeador Dinámico":
     st.subheader("Carga y Procesamiento de la Planilla Maestro de Compras")
     uploaded_reqs = st.file_uploader("Arrastra el archivo de compras aquí", type=["xlsx", "csv"])
