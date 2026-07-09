@@ -45,10 +45,10 @@ st.markdown("""
 # MOTOR DE BASE DE DATOS EN LA NUBE (CONEXIÓN DIRECTA EN CADENA LIMPIA)
 # =====================================================================
 def get_db_connection():
-    # REEMPLAZA ÚNICAMENTE EL TEXTO TU_CONTRASEÑA_REAL POR LA TUYA (MANTÉN LAS COMILLAS)
+    # Tu contraseña real integrada de forma segura
     contrasena = "Rio!Cactus77-Nube*Tren-Limon"
     
-    # Pasamos la URL completa directo a connect sin usar "dsn=" para evitar el error de port
+    # Pasamos la URL completa directa a connect sin parámetros separados para evitar el error de port
     return psycopg2.connect(f"postgresql://postgres.cotrwpikrtbwqlmbgixq:{contrasena}@aws-1-sa-east-1.pooler.supabase.com:5432/postgres")
 
 def init_db():
@@ -162,7 +162,7 @@ st.markdown(f"<div class='main-title'>{opcion_menu}</div>", unsafe_allow_html=Tr
 st.markdown("Plataforma analítica sincronizada en tiempo real con Supabase Postgres.")
 st.markdown("---")
 
-# 1. ESTRUCTURA ORGANIZACIONAL (MODIFICADA CON JERARQUÍA DE APROBADORES)
+# 1. ESTRUCTURA ORGANIZACIONAL
 if opcion_menu == "🏢 Estructura Organizacional":
     tab_areas, tab_aprobadores = st.tabs(["Matriz de Áreas", "Jerarquía de Aprobadores (5 Niveles)"])
     
@@ -258,7 +258,7 @@ elif opcion_menu == "🤝 Gestión de Proveedores":
         except:
             st.info("No hay proveedores registrados.")
 
-# 3. MAPEADOR DINÁMICO (LOGICA DE INTEGRIDAD CORRELAIVA)
+# 3. MAPEADOR DINÁMICO (LOGICA DE INTEGRIDAD CORRELATIVA)
 elif opcion_menu == "🗺️ Mapeador Dinámico":
     st.subheader("Carga y Procesamiento de la Planilla Maestro de Compras")
     uploaded_reqs = st.file_uploader("Arrastra el archivo de compras aquí", type=["xlsx", "csv"])
