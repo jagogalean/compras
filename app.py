@@ -42,15 +42,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# MOTOR DE BASE DE DATOS EN LA NUBE (CONEXIÓN POR DSN DIRECTO)
+# MOTOR DE BASE DE DATOS EN LA NUBE (CONEXIÓN DIRECTA EN CADENA LIMPIA)
 # =====================================================================
 def get_db_connection():
-    # REEMPLAZA ÚNICAMENTE EL TEXTO TU_CONTRASEÑA_REAL POR LA TUYA
+    # REEMPLAZA ÚNICAMENTE EL TEXTO TU_CONTRASEÑA_REAL POR LA TUYA (MANTÉN LAS COMILLAS)
     contrasena = "Rio!Cactus77-Nube*Tren-Limon"
     
-    # Usamos el formato DSN estándar que evita el error de argumentos inesperados
-    dsn = f"postgresql://postgres.cotrwpikrtbwqlmbgixq:{contrasena}@aws-1-sa-east-1.pooler.supabase.com:5432/postgres"
-    return psycopg2.connect(dsn=dsn)
+    # Pasamos la URL completa directo a connect sin usar "dsn=" para evitar el error de port
+    return psycopg2.connect(f"postgresql://postgres.cotrwpikrtbwqlmbgixq:{contrasena}@aws-1-sa-east-1.pooler.supabase.com:5432/postgres")
 
 def init_db():
     conn = get_db_connection()
