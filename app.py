@@ -425,4 +425,11 @@ elif opcion_menu == "⚖️ Cuadro Comparativo":
     
     if not df_quotes.empty:
         def style_matrix(val):
-            return 'background-color: #D1FAE5; color: #065F46;' if isinstance(val, int
+            return 'background-color: #D1FAE5; color: #065F46;' if isinstance(val, int) and val >= 30 else ''
+            
+        st.dataframe(df_quotes.style.applymap(style_matrix, subset=['Días Financiamiento']), use_container_width=True)
+        
+        st.markdown('<div class="recommendation-box">', unsafe_allow_html=True)
+        st.subheader("📝 Recomendación Directiva de la IA")
+        st.markdown(f"*{call_mock_llm('executive_decision', {})}*")
+        st.markdown('</div>', unsafe_allow_html=True)
