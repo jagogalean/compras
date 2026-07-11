@@ -213,7 +213,10 @@ if opcion_menu == "🏢 Estructura Organizacional":
         with get_db_connection() as conn:
             try:
                 df_u = pd.read_sql_query("SELECT nombre AS \"Nombre\", email AS \"Correo Institucional\", rol AS \"Rol Asignado\" FROM usuarios", conn)
-                st.dataframe(df_u, use_container_width=True)
+                if not df_u.empty:
+                    st.dataframe(df_u, use_container_width=True)
+                else:
+                    st.info("No se registran usuarios cargados en el sistema.")
             except:
                 st.info("No se registran usuarios cargados en el sistema.")
 
@@ -226,7 +229,10 @@ if opcion_menu == "🏢 Estructura Organizacional":
                            nivel_aprobacion AS \"Escalón Jerárquico\", secuencia_orden AS \"Orden de Firma\" 
                     FROM usuarios WHERE rol = 'aprobador' ORDER BY secuencia_orden ASC
                 """, conn)
-                st.dataframe(df_aprob, use_container_width=True)
+                if not df_aprob.empty:
+                    st.dataframe(df_aprob, use_container_width=True)
+                else:
+                    st.info("Sin jerarquías configuradas en el maestro.")
             except:
                 st.info("Sin jerarquías configuradas en el maestro.")
 
@@ -240,7 +246,10 @@ elif opcion_menu == "🤝 Gestión de Proveedores":
                        delivery_score AS \"Score Entrega\", quality_score AS \"Score Calidad\" 
                 FROM providers
             """, conn)
-            st.dataframe(df_prov, use_container_width=True)
+            if not df_prov.empty:
+                st.dataframe(df_prov, use_container_width=True)
+            else:
+                st.info("No hay proveedores registrados en la base de datos.")
         except:
             st.info("No hay proveedores registrados en la base de datos.")
 
@@ -307,7 +316,7 @@ elif opcion_menu == "📥 Mapeador Masivo":
                 st.success("Proveedores dados de alta de manera masiva.")
 
     with t_reqs:
-        cols_r = ['Solicitação', 'Situação Solici', 'Pedido', 'Data Aprova', 'Data Solicita', 'E-mail Comp', 'E-mail Aprov', 'E-mail Solicit', 'Código Item', 'Narrativa Item', 'Narrativa Solicitação', 'Cantidad Solicitada']
+        cols_r = ['Solicitação', 'Situação Solici', 'Pedido', 'Data Aprova', 'Data Solicita', 'E-mail Comp', 'E-mail Aprov', 'E-mail Solicit', 'Código Item', 'Narrativa Item', 'Cantidad Solicitada']
         st.download_button("📥 Descargar Estructura Maestro de Compras", generar_excel_descarga(cols_r), "plantilla_maestro.xlsx", "application/vnd.ms-excel")
         up_r = st.file_uploader("Arrastra el archivo maestro consolidado aquí", type=["xlsx", "csv"], key="r_up")
         if up_r:
@@ -352,7 +361,6 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
         
         if not df_detalles_plantilla.empty:
             cols_presupuesto = ['proveedor_ruc', 'precio_total_usd', 'plazo_pago_dias', 'tiempo_entrega_dias']
-            # Unimos los ítems requeridos para que el comprador sepa qué cotizar en el Excel
             df_plantilla_out = pd.DataFrame(columns=cols_presupuesto)
             df_plantilla_out['item_codigo_requerido'] = df_detalles_plantilla['item_codigo']
             
@@ -420,8 +428,8 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
         df_db['data_aprova_dt'] = pd.to_datetime(df_db['data_aprova']).dt.date
         
         total = len(df_db)
-        con_oc = len(df_db[~df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', ''])])
-        retrasados = len(df_db[(df_db['data_aprova_dt'] < un_mes_atras) & (df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', '']))])
+        con_oc = len(df_db[~df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', '', 'None'])])
+        retrasados = len(df_db[(df_db['data_aprova_dt'] < un_mes_atras) & (df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', '', 'None']))])
         
         k1, k2, k3 = st.columns(3)
         k1.metric("Total Requisiciones en Sistema", total)
