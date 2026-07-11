@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
-import psycopg2
-import psycopg2.pool
+import psycopg
+from psycopg_pool import ConnectionPool
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import plotly.express as px
@@ -45,9 +45,10 @@ st.markdown("""
 
 # =====================================================================
 # MOTOR DE BASE DE DATOS EN LA NUBE
-# FIX #1: usamos psycopg2 (coherente con requirements.txt) con un pool
-#          de conexiones cacheado, en vez de abrir/perder una conexión
-#          nueva en cada interacción de Streamlit.
+# FIX #1: usamos psycopg (v3), que sí tiene wheels precompiladas para
+#          Python 3.14 (psycopg2 no las tiene y falla al compilar en
+#          Streamlit Cloud), con un pool de conexiones cacheado en vez
+#          de abrir/perder una conexión nueva en cada interacción.
 # =====================================================================
 @st.cache_resource
 def get_connection_pool():
@@ -56,35 +57,22 @@ def get_connection_pool():
     except KeyError:
         st.error("⚠️ Error Crítico: No se encontró la contraseña en el panel de Secrets de Streamlit.")
         raise
-    return psycopg2.pool.SimpleConnectionPool(
-        1, 10,
-        host="aws-1-sa-east-1.pooler.supabase.com",
-        port=5432,
-        dbname="postgres",
-        user="postgres.cotrwpikrtbwqlmbgixq",
-        password=contrasena,
-        sslmode="require",
+    conninfo = (
+        f"postgresql://postgres.cotrwpikrtbwqlmbgixq:{contrasena}"
+        f"@aws-1-sa-east-1.pooler.supabase.com:5432/postgres?sslmode=require"
     )
+    return ConnectionPool(conninfo, min_size=1, max_size=10, open=True)
 
 
 @contextmanager
 def get_db_connection():
     """Toma una conexión prestada del pool y SIEMPRE la devuelve al terminar.
-    Antes: `with psycopg2.connect(...)` abría una conexión nueva por cada
-    llamada y nunca la cerraba (el `with` de psycopg2 solo maneja la
-    transacción, no el cierre físico de la conexión). Con muchos usuarios
-    o reruns de Streamlit, esto agotaba el límite de conexiones del pooler
-    de Supabase."""
+    Antes: abrir una conexión nueva por cada llamada (con psycopg2.connect)
+    y nunca cerrarla agotaba el límite de conexiones del pooler de
+    Supabase con el uso normal de Streamlit (rerun en cada interacción)."""
     pool_obj = get_connection_pool()
-    conn = pool_obj.getconn()
-    try:
+    with pool_obj.connection() as conn:
         yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        pool_obj.putconn(conn)
 
 
 def init_db():
