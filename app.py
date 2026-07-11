@@ -4,6 +4,7 @@ import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta
 import plotly.express as px
+import io
 
 # =====================================================================
 # CONFIGURACIÓN DE PÁGINA Y ESTILOS UI
@@ -42,89 +43,118 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# MOTOR DE BASE DE DATOS EN LA NUBE (CONEXIÓN SEGURA MEDIANTE ST.SECRETS)
+# MOTOR DE BASE DE DATOS EN LA NUBE (CONEXIÓN SEGURA Y PREVENCION DE FUGAS)
 # =====================================================================
 def get_db_connection():
     try:
-        # Recuperamos la contraseña de forma ultra segura desde el panel de Streamlit Cloud
         contrasena = st.secrets["database"]["password"]
-        
-        # Conexión limpia mediante cadena directa
         return psycopg2.connect(f"postgresql://postgres.cotrwpikrtbwqlmbgixq:{contrasena}@aws-1-sa-east-1.pooler.supabase.com:5432/postgres")
     except KeyError:
         st.error("⚠️ Error Crítico: No se encontró la contraseña en el panel de Secrets de Streamlit.")
         raise
 
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # 1. Tabla de Proveedores
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS providers (
-            id SERIAL PRIMARY KEY,
-            name TEXT UNIQUE,
-            email TEXT,
-            contact_phone TEXT,
-            delivery_score REAL DEFAULT 10,
-            quality_score REAL DEFAULT 10,
-            flexibility_score REAL DEFAULT 10,
-            financial_health_score REAL DEFAULT 10,
-            general_notes TEXT
-        )
-    """)
-    
-    # 2. Áreas y Correos Solicitantes
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS areas_emails (
-            id SERIAL PRIMARY KEY,
-            area_name TEXT,
-            email TEXT UNIQUE
-        )
-    """)
-    
-    # 3. Flujo Jerárquico de Aprobadores (5 Niveles)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS approval_levels (
-            id SERIAL PRIMARY KEY,
-            approver_email TEXT UNIQUE,
-            level_name TEXT,  
-            sequence_order INTEGER
-        )
-    """)
-    
-    # 4. Tabla Maestra de Requisiciones (Estructura Correlativa Basada en 'Solicitação')
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS requisitions (
-            req_code TEXT PRIMARY KEY,          
-            situacao_solici TEXT,               
-            pedido TEXT,                        
-            data_aprova DATE,                   
-            data_solicita DATE,                 
-            analista_email TEXT,                
-            aprobador_actual TEXT,              
-            narrativa_item TEXT,                
-            narrativa_solicitacion TEXT,        
-            area_name TEXT DEFAULT 'Pendiente de Clasificación'
-        )
-    """)
-    
-    # 5. Presupuestos / Cuadro Comparativo
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS budgets (
-            id SERIAL PRIMARY KEY,
-            req_code TEXT,
-            provider_name TEXT,
-            price REAL,
-            quality_rating REAL,
-            payment_terms_days INTEGER,
-            delivery_time_days INTEGER
-        )
-    """)
-    
-    conn.commit()
-    cursor.close()
-    conn.close()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            # 1. Usuarios, Roles y Niveles de Aprobación Masiva
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS usuarios (
+                    id SERIAL PRIMARY KEY,
+                    nombre TEXT,
+                    email TEXT UNIQUE,
+                    rol TEXT,
+                    nivel_aprobacion TEXT,
+                    secuencia_orden INTEGER DEFAULT 0
+                )
+            """)
+            
+            # 2. Catálogo Maestro de Items
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS items (
+                    codigo TEXT PRIMARY KEY,
+                    descripcion_estandar TEXT,
+                    unidad_medida TEXT
+                )
+            """)
+            
+            # 3. Directorio de Proveedores
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS providers (
+                    id SERIAL PRIMARY KEY,
+                    ruc TEXT UNIQUE,
+                    name TEXT,
+                    email TEXT,
+                    contact_phone TEXT,
+                    delivery_score REAL DEFAULT 10,
+                    quality_score REAL DEFAULT 10,
+                    flexibility_score REAL DEFAULT 10,
+                    financial_health_score REAL DEFAULT 10,
+                    general_notes TEXT
+                )
+            """)
+            
+            # 4. Áreas y Correos Solicitantes (Tabla de control automatizado)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS areas_emails (
+                    id SERIAL PRIMARY KEY,
+                    area_name TEXT,
+                    email TEXT UNIQUE
+                )
+            """)
+            
+            # 5. Cabecera de Requisiciones (Estructura Correlativa Unificada)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS requisitions (
+                    req_code TEXT PRIMARY KEY,          
+                    situacao_solici TEXT,               
+                    pedido TEXT,                        
+                    data_aprova DATE,                   
+                    data_solicita DATE,                 
+                    analista_email TEXT,                
+                    aprobador_actual TEXT,              
+                    area_name TEXT DEFAULT 'Pendiente de Clasificación',
+                    secuencia_aprobacion_actual INTEGER DEFAULT 1
+                )
+            """)
+
+            # 6. Desglose de Líneas y Artículos (Requisiciones Detalles)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS requisitions_detalles (
+                    id SERIAL PRIMARY KEY,
+                    requisicion_id TEXT REFERENCES requisitions(req_code) ON DELETE CASCADE,
+                    item_codigo TEXT,
+                    narrativa_solicitante TEXT,
+                    cantidad_solicitada INTEGER,
+                    cantidad_comprador INTEGER
+                )
+            """)
+            
+            # 7. Presupuestos y Cotizaciones Masivas
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS budgets (
+                    id SERIAL PRIMARY KEY,
+                    req_code TEXT REFERENCES requisitions(req_code) ON DELETE CASCADE,
+                    provider_ruc TEXT,
+                    price REAL,
+                    payment_terms_days INTEGER,
+                    delivery_time_days INTEGER,
+                    seleccionado BOOLEAN DEFAULT FALSE
+                )
+            """)
+
+            # 8. Bitácora de Trazabilidad y Auditoría Obligatoria
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS trazabilidad_cambios (
+                    id SERIAL PRIMARY KEY,
+                    requisicion_id TEXT,
+                    campo_modificado TEXT,
+                    valor_anterior TEXT,
+                    valor_nuevo TEXT,
+                    justificacion TEXT,
+                    fecha_cambio TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
 
 try:
     init_db()
@@ -136,6 +166,14 @@ def call_mock_llm(prompt_type, data):
     if prompt_type == "executive_decision":
         return "**RECOMENDACIÓN DIRECTIVA (10s):** Se aconseja priorizar los flujos con plazos de financiamiento mayores a 30 días para proteger la caja operativa."
     return "Análisis no disponible."
+
+# GENERADOR DE EXCEL EN MEMORIA PARA PLANTILLAS
+def generar_excel_descarga(columnas, data=None):
+    output = io.BytesIO()
+    df = pd.DataFrame(data, columns=columnas) if data else pd.DataFrame(columns=columnas)
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Plantilla Modelo')
+    return output.getvalue()
 
 # =====================================================================
 # SIDEBAR (CONTROLES GLOBALES)
@@ -149,15 +187,15 @@ opcion_menu = st.sidebar.radio(
     [
         "🏢 Estructura Organizacional",
         "🤝 Gestión de Proveedores",
-        "🗺️ Mapeador Dinámico",
-        "📊 Dashboard Ejecutivo",
-        "⚖️ Cuadro Comparativo"
+        "📥 Mapeador Masivo",
+        "⚖️ Cuadro Comparativo Masivo",
+        "📊 Dashboard Ejecutivo"
     ]
 )
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎛️ Filtros Gerenciales")
-status_filter = st.sidebar.multiselect("Estado General", ["Com Ordem", "Fechada"], default=["Com Ordem", "Fechada"])
+status_filter = st.sidebar.multiselect("Estado General", ["Com Ordem", "Fechada", "Pendiente Aprobación"], default=["Com Ordem", "Fechada"])
 
 # =====================================================================
 # RENDERIZADO LÓGICO
@@ -166,259 +204,274 @@ st.markdown(f"<div class='main-title'>{opcion_menu}</div>", unsafe_allow_html=Tr
 st.markdown("Plataforma analítica sincronizada en tiempo real con Supabase Postgres.")
 st.markdown("---")
 
-# 1. ESTRUCTURA ORGANIZACIONAL
+# 1. ESTRUCTURA ORGANIZACIONAL (MODO CONSULTA Y RUTA CRÍTICA)
 if opcion_menu == "🏢 Estructura Organizacional":
-    tab_areas, tab_aprobadores = st.tabs(["Matriz de Áreas", "Jerarquía de Aprobadores (5 Niveles)"])
+    tab_usuarios, tab_ruta = st.tabs(["👥 Directorio de Usuarios", "⛓️ Ruta Crítica de Autorizaciones"])
     
-    with tab_areas:
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.subheader("Vincular Área")
-            with st.form("form_areas"):
-                area_name = st.text_input("Nombre de la Unidad / Área")
-                area_email = st.text_input("Correo Institucional del Área")
-                submit_area = st.form_submit_button("Vincular Cuenta")
-                
-                if submit_area and area_name and area_email:
-                    try:
-                        conn = get_db_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("INSERT INTO areas_emails (area_name, email) VALUES (%s, %s) ON CONFLICT (email) DO NOTHING", (area_name, area_email))
-                        conn.commit()
-                        cursor.close()
-                        conn.close()
-                        st.success("Área vinculada correctamente.")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-        with col2:
-            st.subheader("Áreas Registradas")
+    with tab_usuarios:
+        st.subheader("Personal con acceso e Indexación en el Flujo")
+        with get_db_connection() as conn:
             try:
-                conn = get_db_connection()
-                df_areas = pd.read_sql_query("SELECT area_name AS \"Área\", email AS \"Correo Asociado\" FROM areas_emails", conn)
-                conn.close()
-                st.dataframe(df_areas, use_container_width=True)
+                df_u = pd.read_sql_query("SELECT nombre AS \"Nombre\", email AS \"Correo Institucional\", rol AS \"Rol Asignado\" FROM usuarios", conn)
+                st.dataframe(df_u, use_container_width=True)
             except:
-                st.info("Sin áreas en la nube.")
+                st.info("No se registran usuarios cargados en el sistema.")
 
-    with tab_aprobadores:
-        col_ap1, col_ap2 = st.columns([1, 2])
-        with col_ap1:
-            st.subheader("Registrar Aprobador")
-            with st.form("form_aprobadores"):
-                ap_email = st.text_input("Correo del Aprobador (Como sale en la planilla)")
-                ap_level = st.selectbox("Nivel de Aprobación", ["1er Aprobador", "2do Aprobador", "3er Aprobador", "4to Aprobador", "Aprobador Final"])
-                ap_order = st.slider("Orden de Secuencia (1-5)", 1, 5, 1)
-                submit_ap = st.form_submit_button("Guardar en Flujo")
-                
-                if submit_ap and ap_email:
-                    try:
-                        conn = get_db_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                            INSERT INTO approval_levels (approver_email, level_name, sequence_order) 
-                            VALUES (%s, %s, %s) 
-                            ON CONFLICT (approver_email) DO UPDATE SET level_name=EXCLUDED.level_name, sequence_order=EXCLUDED.sequence_order
-                        """, (ap_email, ap_level, ap_order))
-                        conn.commit()
-                        cursor.close()
-                        conn.close()
-                        st.success("Aprobador indexado al flujo.")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-        with col_ap2:
-            st.subheader("Ruta Crítica de Autorizaciones")
+    with tab_ruta:
+        st.subheader("Flujo de Aprobadores Secuenciales en Cascada")
+        with get_db_connection() as conn:
             try:
-                conn = get_db_connection()
-                df_aprob = pd.read_sql_query("SELECT approver_email AS \"Correo\", level_name AS \"Nivel Asignado\", sequence_order AS \"Secuencia\" FROM approval_levels ORDER BY sequence_order ASC", conn)
-                conn.close()
+                df_aprob = pd.read_sql_query("""
+                    SELECT nombre AS \"Nombre Aprobador\", email AS \"Correo\", 
+                           nivel_aprobacion AS \"Escalón Jerárquico\", secuencia_orden AS \"Orden de Firma\" 
+                    FROM usuarios WHERE rol = 'aprobador' ORDER BY secuencia_orden ASC
+                """, conn)
                 st.dataframe(df_aprob, use_container_width=True)
             except:
-                st.info("Sin niveles configurados.")
+                st.info("Sin jerarquías configuradas en el maestro.")
 
 # 2. GESTIÓN DE PROVEEDORES
 elif opcion_menu == "🤝 Gestión de Proveedores":
-    col_m1, col_m2 = st.columns([1, 2])
-    with col_m1:
-        st.subheader("Alta Individual")
-        with st.form("form_provider"):
-            p_name = st.text_input("Razón Social")
-            p_email = st.text_input("Email Comercial")
-            submit_p = st.form_submit_button("Registrar")
-            if submit_p and p_name:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO providers (name, email) VALUES (%s, %s) ON CONFLICT(name) DO NOTHING", (p_name, p_email))
-                conn.commit()
-                cursor.close()
-                conn.close()
-                st.success("Proveedor guardado.")
-    with col_m2:
-        st.subheader("Proveedores Activos")
+    st.subheader("Directorio Maestro e Indicadores de Operabilidad")
+    with get_db_connection() as conn:
         try:
-            conn = get_db_connection()
-            df_prov = pd.read_sql_query("SELECT name AS \"Proveedor\", email AS \"Email\" FROM providers", conn)
-            conn.close()
+            df_prov = pd.read_sql_query("""
+                SELECT ruc AS \"RUC\", name AS \"Razón Social\", email AS \"Email Comercial\", 
+                       delivery_score AS \"Score Entrega\", quality_score AS \"Score Calidad\" 
+                FROM providers
+            """, conn)
             st.dataframe(df_prov, use_container_width=True)
         except:
-            st.info("No hay proveedores registrados.")
+            st.info("No hay proveedores registrados en la base de datos.")
 
-# 3. MAPEADOR DINÁMICO (LOGICA DE INTEGRIDAD CORRELATIVA)
-elif opcion_menu == "🗺️ Mapeador Dinámico":
-    st.subheader("Carga y Procesamiento de la Planilla Maestro de Compras")
-    uploaded_reqs = st.file_uploader("Arrastra el archivo de compras aquí", type=["xlsx", "csv"])
+# 3. MAPEADOR MASIVO (EL CORAZÓN DE LAS BASES DE DATOS - PESTAÑAS CON PLANTILLAS)
+elif opcion_menu == "📥 Mapeador Masivo":
+    st.subheader("Carga, Validación e Inicialización Masiva de Registros mediante Excel")
     
-    if uploaded_reqs:
-        df_reqs = pd.read_excel(uploaded_reqs) if uploaded_reqs.name.endswith('xlsx') else pd.read_csv(uploaded_reqs)
+    t_usuarios, t_items, t_prov, t_reqs = st.tabs([
+        "👥 Carga de Usuarios", "📦 Catálogo de Ítems", "🏢 Directorio Proveedores", "📑 Planilla Maestro Requisiciones"
+    ])
+    
+    with t_usuarios:
+        cols_u = ['nombre', 'email', 'rol', 'nivel_aprobacion', 'secuencia_orden']
+        st.download_button("📥 Descargar Plantilla Ejemplo (Usuarios)", generar_excel_descarga(cols_u), "ejemplo_usuarios.xlsx", "application/vnd.ms-excel")
+        up_u = st.file_uploader("Subir planilla de usuarios", type=["xlsx", "csv"], key="u_up")
+        if up_u:
+            df = pd.read_excel(up_u) if up_u.name.endswith('xlsx') else pd.read_csv(up_u)
+            if st.button("🚀 Procesar Carga Masiva de Usuarios"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        for _, r in df.iterrows():
+                            cursor.execute("""
+                                INSERT INTO usuarios (nombre, email, rol, nivel_aprobacion, secuencia_orden)
+                                VALUES (%s, %s, %s, %s, %s) ON CONFLICT (email) DO UPDATE SET
+                                nombre=EXCLUDED.nombre, rol=EXCLUDED.rol, nivel_aprobacion=EXCLUDED.nivel_aprobacion, secuencia_orden=EXCLUDED.secuencia_orden
+                            """, (r['nombre'], r['email'], r['rol'], r['nivel_aprobacion'], int(r['secuencia_orden'])))
+                        conn.commit()
+                st.success("Usuarios sincronizados masivamente.")
+
+    with t_items:
+        cols_i = ['codigo', 'descripcion_estandar', 'unidad_medida']
+        st.download_button("📥 Descargar Plantilla Ejemplo (Ítems)", generar_excel_descarga(cols_i), "ejemplo_items.xlsx", "application/vnd.ms-excel")
+        up_i = st.file_uploader("Subir planilla del catálogo", type=["xlsx", "csv"], key="i_up")
+        if up_i:
+            df = pd.read_excel(up_i) if up_i.name.endswith('xlsx') else pd.read_csv(up_i)
+            if st.button("🚀 Sincronizar Catálogo de Ítems"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        for _, r in df.iterrows():
+                            cursor.execute("""
+                                INSERT INTO items (codigo, descripcion_estandar, unidad_medida)
+                                VALUES (%s, %s, %s) ON CONFLICT (codigo) DO UPDATE SET
+                                descripcion_estandar=EXCLUDED.descripcion_estandar, unidad_medida=EXCLUDED.unidad_medida
+                            """, (r['codigo'], r['descripcion_estandar'], r['unidad_medida']))
+                        conn.commit()
+                st.success("Catálogo maestro actualizado sin duplicados.")
+
+    with t_prov:
+        cols_p = ['ruc', 'name', 'email', 'contact_phone']
+        st.download_button("📥 Descargar Plantilla Ejemplo (Proveedores)", generar_excel_descarga(cols_p), "ejemplo_proveedores.xlsx", "application/vnd.ms-excel")
+        up_p = st.file_uploader("Subir planilla de proveedores", type=["xlsx", "csv"], key="p_up")
+        if up_p:
+            df = pd.read_excel(up_p) if up_p.name.endswith('xlsx') else pd.read_csv(up_p)
+            if st.button("🚀 Inyectar Directorio de Proveedores"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        for _, r in df.iterrows():
+                            cursor.execute("""
+                                INSERT INTO providers (ruc, name, email, contact_phone)
+                                VALUES (%s, %s, %s, %s) ON CONFLICT (ruc) DO UPDATE SET
+                                name=EXCLUDED.name, email=EXCLUDED.email, contact_phone=EXCLUDED.contact_phone
+                            """, (str(r['ruc']), r['name'], r['email'], str(r['contact_phone'])))
+                        conn.commit()
+                st.success("Proveedores dados de alta de manera masiva.")
+
+    with t_reqs:
+        cols_r = ['Solicitação', 'Situação Solici', 'Pedido', 'Data Aprova', 'Data Solicita', 'E-mail Comp', 'E-mail Aprov', 'E-mail Solicit', 'Código Item', 'Narrativa Item', 'Narrativa Solicitação', 'Cantidad Solicitada']
+        st.download_button("📥 Descargar Estructura Maestro de Compras", generar_excel_descarga(cols_r), "plantilla_maestro.xlsx", "application/vnd.ms-excel")
+        up_r = st.file_uploader("Arrastra el archivo maestro consolidado aquí", type=["xlsx", "csv"], key="r_up")
+        if up_r:
+            df = pd.read_excel(up_r) if up_r.name.endswith('xlsx') else pd.read_csv(up_r)
+            if st.button("🚀 Ejecutar Motor de Integridad Correlativa (Cabecera + Detalle)"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        for _, row in df.iterrows():
+                            req_code_val = str(row['Solicitação']).strip()
+                            d_aprova = pd.to_datetime(row['Data Aprova']).date() if pd.notnull(row['Data Aprova']) else None
+                            d_solicita = pd.to_datetime(row['Data Solicita']).date() if pd.notnull(row['Data Solicita']) else None
+                            
+                            # Clasificación Automática de Áreas basada en el Correo Solicitante
+                            cursor.execute("SELECT area_name FROM areas_emails WHERE email = %s", (str(row['E-mail Solicit']).strip(),))
+                            area_row = cursor.fetchone()
+                            assigned_area = area_row[0] if area_row else "Pendiente de Clasificación"
+                            
+                            # Insertar/Actualizar Cabecera
+                            cursor.execute("""
+                                INSERT INTO requisitions (req_code, situacao_solici, pedido, data_aprova, data_solicita, analista_email, aprobador_actual, area_name)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (req_code) DO UPDATE SET
+                                situacao_solici=EXCLUDED.situacao_solici, pedido=EXCLUDED.pedido, data_aprova=EXCLUDED.data_aprova, aprobador_actual=EXCLUDED.aprobador_actual, area_name=EXCLUDED.area_name
+                            """, (req_code_val, str(row['Situação Solici']), str(row['Pedido']), d_aprova, d_solicita, str(row['E-mail Comp']), str(row['E-mail Aprov']), assigned_area))
+                            
+                            # Insertar Detalle Desglosado por Línea
+                            cursor.execute("""
+                                INSERT INTO requisitions_detalles (requisicion_id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador)
+                                VALUES (%s, %s, %s, %s, %s)
+                            """, (req_code_val, str(row['Código Item']), str(row['Narrativa Item']), int(row['Cantidad Solicitada']), int(row['Cantidad Solicitada'])))
+                        conn.commit()
+                st.success("Estructura transaccional mapeada con total integridad en Supabase.")
+
+# 4. CUADRO COMPARATIVO MASIVO Y FLUJO DE APROBACIÓN JERÁRQUICA
+elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
+    c_req_code = st.text_input("Código de Requisición a Gestionar", "14660")
+    
+    col_acc1, col_acc2 = st.columns(2)
+    with col_acc1:
+        st.markdown("### Paso 1: Obtener Plantilla Estructurada")
+        with get_db_connection() as conn:
+            df_detalles_plantilla = pd.read_sql_query("SELECT item_codigo, narrativa_solicitante, cantidad_solicitada FROM requisitions_detalles WHERE requisicion_id = %s", conn, params=(c_req_code,))
         
-        required_cols = ['Solicitação', 'Situação Solici', 'Pedido', 'Data Aprova', 'Data Solicita', 'E-mail Comp', 'E-mail Aprov', 'Narrativa ITE', 'Narrativa Solicitação', 'E-mail Solicit']
-        missing_cols = [c for c in required_cols if c not in df_reqs.columns]
-        
-        if missing_cols:
-            st.error(f"Faltan columnas esenciales en el archivo: {missing_cols}")
+        if not df_detalles_plantilla.empty:
+            cols_presupuesto = ['proveedor_ruc', 'precio_total_usd', 'plazo_pago_dias', 'tiempo_entrega_dias']
+            # Unimos los ítems requeridos para que el comprador sepa qué cotizar en el Excel
+            df_plantilla_out = pd.DataFrame(columns=cols_presupuesto)
+            df_plantilla_out['item_codigo_requerido'] = df_detalles_plantilla['item_codigo']
+            
+            output_p = io.BytesIO()
+            with pd.ExcelWriter(output_p, engine='xlsxwriter') as writer:
+                df_plantilla_out.to_excel(writer, index=False, sheet_name='Cotizaciones')
+            st.download_button("📥 Descargar Excel de Cotización Especializada", output_p.getvalue(), f"Cotizacion_Req_{c_req_code}.xlsx", "application/vnd.ms-excel")
         else:
-            st.success("Estructura de archivo validada exitosamente.")
-            st.dataframe(df_reqs.head(3), use_container_width=True)
-            
-            if st.button("🚀 Sincronizar e Indexar Datos en Supabase (Sin Duplicados)"):
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                
-                contador_nuevos = 0
-                contador_actualizados = 0
-                
-                for idx, row in df_reqs.iterrows():
-                    req_code_val = str(row['Solicitação']).strip()
-                    
-                    def parse_date(val):
-                        try:
-                            return pd.to_datetime(val).date()
-                        except:
-                            return None
-                    
-                    d_aprova = parse_date(row['Data Aprova'])
-                    d_solicita = parse_date(row['Data Solicita'])
-                    
-                    cursor.execute("SELECT 1 FROM requisitions WHERE req_code = %s", (req_code_val,))
-                    existe = cursor.fetchone()
-                    if existe:
-                        contador_actualizados += 1
-                    else:
-                        contador_nuevos += 1
-                    
-                    email_solicitante = str(row['E-mail Solicit']).strip()
-                    cursor.execute("SELECT area_name FROM areas_emails WHERE email = %s", (email_solicitante,))
-                    area_row = cursor.fetchone()
-                    assigned_area = area_row[0] if area_row else "No asignado / Pendiente de Clasificación"
-                    
-                    cursor.execute("""
-                        INSERT INTO requisitions (
-                            req_code, situacao_solici, pedido, data_aprova, data_solicita, 
-                            analista_email, aprobador_actual, narrativa_item, narrativa_solicitacion, area_name
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (req_code) DO UPDATE SET
-                            situacao_solici = EXCLUDED.situacao_solici,
-                            pedido = EXCLUDED.pedido,
-                            data_aprova = EXCLUDED.data_aprova,
-                            data_solicita = EXCLUDED.data_solicita,
-                            analista_email = EXCLUDED.analista_email,
-                            aprobador_actual = EXCLUDED.aprobador_actual,
-                            narrativa_item = EXCLUDED.narrativa_item,
-                            narrativa_solicitacion = EXCLUDED.narrativa_solicitacion,
-                            area_name = EXCLUDED.area_name
-                    """, (
-                        req_code_val, str(row['Situação Solici']), str(row['Pedido']), d_aprova, d_solicita,
-                        str(row['E-mail Comp']), str(row['E-mail Aprov']), str(row['Narrativa ITE']), str(row['Narrativa Solicitação']), assigned_area
-                    ))
-                
-                conn.commit()
-                cursor.close()
-                conn.close()
-                st.success(f"⚡ Sincronización Exitosa: {contador_nuevos} requisiciones nuevas agregadas, {contador_actualizados} estados actualizados por número de requisición.")
+            st.warning("No se encontraron ítems para este código de requisición.")
 
-# 4. DASHBOARD EJECUTIVO (CORREGIDO PARA ANALÍTICA CLARA)
-elif opcion_menu == "📊 Dashboard Ejecutivo":
-    conn = get_db_connection()
-    df_db = pd.read_sql_query("SELECT * FROM requisitions", conn)
-    df_levels = pd.read_sql_query("SELECT approver_email, level_name FROM approval_levels", conn)
-    conn.close()
-    
-    if not df_db.empty:
-        df_db = df_db.merge(df_levels, left_on='aprobador_actual', right_on='approver_email', how='left')
-        df_db['level_name'] = df_db['level_name'].fillna("Sin Aprobador Asignado")
-        
-        # 1. Lógica precisa de fechas
-        hoy = datetime.now().date()
-        un_mes_atras = hoy - timedelta(days=30)
-        
-        # Convertir a datetime para asegurar comparaciones correctas
-        df_db['data_aprova_dt'] = pd.to_datetime(df_db['data_aprova']).dt.date
-        
-        # 2. Cálculo matemático real
-        total = len(df_db)
-        # Requisiciones con OC (excluyendo '0', '0.0', vacíos)
-        con_oc = len(df_db[~df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', ''])])
-        # Retrasos: solo las que NO tienen OC y su fecha de aprobación es antigua
-        retrasados = len(df_db[(df_db['data_aprova_dt'] < un_mes_atras) & (df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', '']))])
-        
-        # Mostrar KPIs
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Total Requisiciones", total)
-        k2.metric("Con Orden de Compra", con_oc)
-        k3.metric("Alertas por Retraso (Sin OC)", retrasados)
-        
-        st.markdown("---")
-        
-        # 3. Gráficos en columnas (No más tortas)
-        g1, g2 = st.columns(2)
-        
-        with g1:
-            fig_area = px.histogram(df_db, x='area_name', color='situacao_solici', 
-                                    title="Estatus de Requisiciones por Área")
-            st.plotly_chart(fig_area, use_container_width=True)
-            
-        with g2:
-            # Gráfico de barras para Aprobadores
-            fig_aprov = px.histogram(df_db, x='level_name', title="Distribución de Carga por Aprobador")
-            fig_aprov.update_layout(xaxis={'categoryorder':'total descending'})
-            st.plotly_chart(fig_aprov, use_container_width=True)
-            
-        st.subheader("Vista Operativa Detallada")
-        st.dataframe(df_db[['req_code', 'area_name', 'data_aprova', 'pedido', 'level_name']], use_container_width=True)
-    else:
-        st.info("No hay datos en la nube.")
+    with col_acc2:
+        st.markdown("### Paso 2: Carga Masiva de Presupuestos")
+        up_quotes = st.file_uploader("Cargar planilla de ofertas completada", type=["xlsx"], key="quotes_masivo")
+        if up_quotes:
+            df_q = pd.read_excel(up_quotes)
+            if st.button("🚀 Consolidar Cuadro Comparativo y Disparar Flujo Jerárquico"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        for _, r in df_q.iterrows():
+                            cursor.execute("""
+                                INSERT INTO budgets (req_code, provider_ruc, price, payment_terms_days, delivery_time_days)
+                                VALUES (%s, %s, %s, %s, %s)
+                            """, (c_req_code, str(r['proveedor_ruc']), float(r['precio_total_usd']), int(r['plazo_pago_dias']), int(r['tiempo_entrega_dias'])))
+                        
+                        # Cambiar estado de la requisición y setear primer escalón de aprobación
+                        cursor.execute("""
+                            UPDATE requisitions SET 
+                            situacao_solici = 'Pendiente Aprobación',
+                            secuencia_aprobacion_actual = 1 
+                            WHERE req_code = %s
+                        """, (c_req_code,))
+                        conn.commit()
+                st.success("Ofertas indexadas. La requisición avanzó a la ruta crítica del 'Aprobador 1'.")
 
-# 5. CUADRO COMPARATIVO
-elif opcion_menu == "⚖️ Cuadro Comparativo":
-    c_req_code = st.text_input("Código de Requisición a Analizar", "14660")
-    
-    with st.form("form_quotes"):
-        col_q1, col_q2 = st.columns(2)
-        with col_q1:
-            q_prov = st.text_input("Nombre del Proveedor Postulante")
-            q_price = st.number_input("Cotización Total (USD)", min_value=0.0)
-        with col_q2:
-            q_terms = st.number_input("Plazo de Pago (Días)", min_value=0)
-            q_days = st.number_input("Plazo de Entrega Comercial (Días)", min_value=1)
-            
-        if st.form_submit_button("Indexar Oferta al Cuadro"):
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO budgets (req_code, provider_name, price, payment_terms_days, delivery_time_days)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (c_req_code, q_prov, q_price, int(q_terms), int(q_days)))
-            conn.commit()
-            cursor.close()
-            conn.close()
-            st.success("Cotización asociada a la Requisición.")
-
-    conn = get_db_connection()
-    df_quotes = pd.read_sql_query("SELECT provider_name AS \"Proveedor\", price AS \"Precio USD\", payment_terms_days AS \"Días Financiamiento\", delivery_time_days AS \"Tiempo de Entrega Días\" FROM budgets WHERE req_code = %s", conn, params=(c_req_code,))
-    conn.close()
-    
+    # Mostrar la matriz resultante en pantalla
+    st.markdown("---")
+    st.subheader(f"Matriz de Comparación Operativa para Requisición: {c_req_code}")
+    with get_db_connection() as conn:
+        df_quotes = pd.read_sql_query("""
+            SELECT b.provider_ruc AS \"RUC Proveedor\", p.name AS \"Razón Social\", 
+                   b.price AS \"Precio USD\", b.payment_terms_days AS \"Plazo Pago (Días)\", 
+                   b.delivery_time_days AS \"Tiempo Entrega (Días)\"
+            FROM budgets b
+            LEFT JOIN providers p ON b.provider_ruc = p.ruc
+            WHERE b.req_code = %s
+        """, conn, params=(c_req_code,))
+        
     if not df_quotes.empty:
         st.dataframe(df_quotes, use_container_width=True)
         st.markdown('<div class="recommendation-box">', unsafe_allow_html=True)
-        st.subheader("💡 Análisis Directivo del Sistema")
+        st.subheader("💡 Análisis de Negociación IA")
         st.markdown(f"*{call_mock_llm('executive_decision', {})}*")
         st.markdown('</div>', unsafe_allow_html=True)
+
+# 5. DASHBOARD EJECUTIVO (VERSIÓN OPERATIVA Y CONTROL AUDITABLE)
+elif opcion_menu == "📊 Dashboard Ejecutivo":
+    with get_db_connection() as conn:
+        df_db = pd.read_sql_query("SELECT * FROM requisitions", conn)
+        df_usuarios = pd.read_sql_query("SELECT email, nombre, nivel_aprobacion, secuencia_orden FROM usuarios WHERE rol='aprobador'", conn)
+    
+    if not df_db.empty:
+        # Lógica matemática precisa
+        hoy = datetime.now().date()
+        un_mes_atras = hoy - timedelta(days=30)
+        df_db['data_aprova_dt'] = pd.to_datetime(df_db['data_aprova']).dt.date
+        
+        total = len(df_db)
+        con_oc = len(df_db[~df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', ''])])
+        retrasados = len(df_db[(df_db['data_aprova_dt'] < un_mes_atras) & (df_db['pedido'].astype(str).str.strip().isin(['0', '0.0', 'NaN', '']))])
+        
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total Requisiciones en Sistema", total)
+        k2.metric("Convertidas en Orden de Compra (OC)", con_oc)
+        k3.metric("Alertas Críticas por Retraso (Sin OC)", retrasados)
+        
+        st.markdown("---")
+        g1, g2 = st.columns(2)
+        with g1:
+            fig_area = px.histogram(df_db, x='area_name', color='situacao_solici', title="Estatus Estructural de Requisiciones por Área")
+            st.plotly_chart(fig_area, use_container_width=True)
+        with g2:
+            fig_aprov = px.histogram(df_db, x='aprobador_actual', title="Carga Dinámica de Órdenes Retenidas por Autorizante")
+            st.plotly_chart(fig_aprov, use_container_width=True)
+            
+        # INTERFAZ DONDE EL COMPRADOR "METE MANO" (AUDITORÍA COMPLETA)
+        st.markdown("---")
+        st.subheader("🛠️ Auditoría y Modificación de Cantidades por Compras")
+        
+        select_req = st.selectbox("Seleccione el código de orden a auditar cantidades:", df_db['req_code'].unique())
+        
+        with get_db_connection() as conn:
+            df_detalles = pd.read_sql_query("SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = %s", conn, params=(select_req,))
+        
+        if not df_detalles.empty:
+            st.dataframe(df_detalles, use_container_width=True)
+            
+            with st.form("form_modificar_cantidades"):
+                id_linea = st.number_input("ID de la línea a modificar", min_value=int(df_detalles['id'].min()), max_value=int(df_detalles['id'].max()))
+                nueva_cantidad = st.number_input("Nueva Cantidad Autorizada por Compras", min_value=0, value=10)
+                justificacion_compra = st.text_area("Justificación del Cambio (Campo Obligatorio)")
+                
+                if st.form_submit_button("Guardar Cambios de Auditoría"):
+                    if not justificacion_compra.strip():
+                        st.error("⚠️ Operación Bloqueada: Debe ingresar un motivo válido para alterar las cantidades originales del solicitante.")
+                    else:
+                        row_modificada = df_detalles[df_detalles['id'] == id_linea].iloc[0]
+                        valor_anterior_cant = str(row_modificada['cantidad_comprador'])
+                        
+                        with get_db_connection() as conn:
+                            with conn.cursor() as cursor:
+                                # Actualizar cantidad modificada por el comprador
+                                cursor.execute("UPDATE requisitions_detalles SET cantidad_comprador = %s WHERE id = %s", (nueva_cantidad, id_linea))
+                                # Escribir registro histórico en la bitácora de trazabilidad
+                                cursor.execute("""
+                                    INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (select_req, 'cantidad_comprador', valor_anterior_cant, str(nueva_cantidad), justificacion_compra))
+                            conn.commit()
+                        st.success("Cantidad rectificada y registrada en la bitácora de trazabilidad de cambios.")
+                        st.rerun()
+    else:
+        st.info("No se registran datos en la nube.")
