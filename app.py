@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import psycopg
 from psycopg_pool import ConnectionPool
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import plotly.express as px
@@ -46,10 +46,6 @@ st.markdown("""
 
 # =====================================================================
 # MOTOR DE BASE DE DATOS EN LA NUBE
-# FIX #1: usamos psycopg (v3), que sí tiene wheels precompiladas para
-#          Python 3.14 (psycopg2 no las tiene y falla al compilar en
-#          Streamlit Cloud), con un pool de conexiones cacheado en vez
-#          de abrir/perder una conexión nueva en cada interacción.
 # =====================================================================
 @st.cache_resource
 def get_connection_pool():
@@ -64,34 +60,21 @@ def get_connection_pool():
     )
     return ConnectionPool(conninfo, min_size=1, max_size=10, open=True)
 
-
 @contextmanager
 def get_db_connection():
-    """Toma una conexión prestada del pool y SIEMPRE la devuelve al terminar.
-    Antes: abrir una conexión nueva por cada llamada (con psycopg2.connect)
-    y nunca cerrarla agotaba el límite de conexiones del pooler de
-    Supabase con el uso normal de Streamlit (rerun en cada interacción)."""
     pool_obj = get_connection_pool()
     with pool_obj.connection() as conn:
         yield conn
 
-
 @st.cache_resource
 def get_engine():
-    """Motor de SQLAlchemy dedicado a pd.read_sql_query.
-    FIX #segfault: pasarle a pandas una conexión DBAPI2 cruda de psycopg
-    (en vez de un engine/conexión de SQLAlchemy) no está oficialmente
-    soportado desde pandas 3.0 (solo genera un warning), y en la
-    combinación pandas 3.0 + psycopg 3 + Python 3.14 provocaba un
-    segmentation fault en producción. Usar un engine de SQLAlchemy para
-    las lecturas es la vía soportada y estable."""
+    """Motor de SQLAlchemy dedicado a pd.read_sql_query para evitar Segmentation Faults."""
     contrasena = st.secrets["database"]["password"]
     url = (
         f"postgresql+psycopg://postgres.cotrwpikrtbwqlmbgixq:{contrasena}"
         f"@aws-1-sa-east-1.pooler.supabase.com:5432/postgres?sslmode=require"
     )
     return create_engine(url, pool_size=5, max_overflow=5, pool_pre_ping=True)
-
 
 def init_db():
     with get_db_connection() as conn:
@@ -180,30 +163,22 @@ def init_db():
                 )
             """)
 
-
 try:
     init_db()
 except Exception as e:
     st.error(f"Error de conexión con Supabase: {e}. Verifica la configuración en Streamlit.")
 
 # =====================================================================
-# HELPERS DE LIMPIEZA DE DATOS
-# FIX #3: Excel/pandas interpreta columnas de identificadores (RUC,
-#          código de requisición) como float cuando no tienen texto,
-#          lo que produce "80012345.0" en vez de "80012345".
-# FIX #6: conversiones int() sin manejo de celdas vacías/NaN.
+# HELPERS Y UTILIDADES
 # =====================================================================
 def clean_id(value):
-    """Convierte un valor leído de Excel a texto limpio, sin sufijo '.0'."""
     if pd.isna(value):
         return ""
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
 
-
 def safe_int(value, default=0):
-    """Convierte a int tolerando celdas vacías, NaN o texto no numérico."""
     try:
         if pd.isna(value):
             return default
@@ -211,15 +186,11 @@ def safe_int(value, default=0):
     except (ValueError, TypeError):
         return default
 
-
-# SIMULADOR MOCK DE LLM
 def call_mock_llm(prompt_type, data):
     if prompt_type == "executive_decision":
         return "**RECOMENDACIÓN DIRECTIVA (10s):** Se aconseja priorizar los flujos con plazos de financiamiento mayores a 30 días para proteger la caja operativa."
     return "Análisis no disponible."
 
-
-# GENERADOR DE EXCEL EN MEMORIA PARA PLANTILLAS
 def generar_excel_descarga(columnas, data=None):
     output = io.BytesIO()
     df = pd.DataFrame(data, columns=columnas) if data else pd.DataFrame(columns=columnas)
@@ -229,26 +200,80 @@ def generar_excel_descarga(columnas, data=None):
 
 
 # =====================================================================
+# SISTEMA DE AUTENTICACIÓN IMPLACABLE
+# =====================================================================
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+    st.session_state.user_email = ""
+    st.session_state.user_role = ""
+    st.session_state.user_name = ""
+
+if not st.session_state.authenticated:
+    st.markdown("<h1 style='text-align: center; color: #1E3A8A; margin-top: 50px;'>Control de Acceso Requerido</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>Identificación obligatoria para ingresar al perímetro de gestión.</p>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("login_form"):
+            email_input = st.text_input("Correo Institucional (Identificador de Usuario)")
+            password_input = st.text_input("Contraseña de Acceso", type="password")
+            submit_btn = st.form_submit_button("Someter a Verificación")
+            
+            if submit_btn:
+                if not email_input or not password_input:
+                    st.error("Denegado: Es obligatorio proveer credenciales completas.")
+                else:
+                    try:
+                        df_user = pd.read_sql_query(
+                            "SELECT nombre, email, rol FROM usuarios WHERE email = %(email)s", 
+                            get_engine(), 
+                            params={"email": email_input.strip()}
+                        )
+                        if not df_user.empty:
+                            st.session_state.authenticated = True
+                            st.session_state.user_email = df_user.iloc[0]['email']
+                            st.session_state.user_role = df_user.iloc[0]['rol'].lower()
+                            st.session_state.user_name = df_user.iloc[0]['nombre']
+                            st.rerun()
+                        else:
+                            st.error("Denegado: Identidad no encontrada en el registro maestro de Supabase.")
+                    except Exception as e:
+                        st.error(f"Error durante la validación: {e}")
+    st.stop()
+
+
+# =====================================================================
 # SIDEBAR (CONTROLES GLOBALES)
 # =====================================================================
-st.sidebar.markdown("<h2 style='color:#1E3A8A; font-weight:700;'>🏛️ Panel de Control</h2>", unsafe_allow_html=True)
+st.sidebar.markdown(f"<h2 style='color:#1E3A8A; font-weight:700;'>🏛️ Panel de {st.session_state.user_name}</h2>", unsafe_allow_html=True)
+st.sidebar.markdown(f"**Rol Detectado:** {st.session_state.user_role.capitalize()}")
 st.sidebar.markdown("---")
 
 st.sidebar.subheader("🗂️ Módulos del Sistema")
-opcion_menu = st.sidebar.radio(
-    "Seleccione una sección:",
-    [
-        "🏢 Estructura Organizacional",
-        "🤝 Gestión de Proveedores",
-        "📥 Mapeador Masivo",
+
+# Discriminación de menú según el rol
+opciones_permitidas = [
+    "🏢 Estructura Organizacional",
+    "🤝 Gestión de Proveedores",
+    "📥 Mapeador Masivo"
+]
+
+if st.session_state.user_role == "aprobador":
+    opciones_permitidas.extend([
         "⚖️ Cuadro Comparativo Masivo",
         "📊 Dashboard Ejecutivo"
-    ]
-)
+    ])
+
+opcion_menu = st.sidebar.radio("Seleccione una sección:", opciones_permitidas)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎛️ Filtros Gerenciales")
 status_filter = st.sidebar.multiselect("Estado General", ["Com Ordem", "Fechada", "Pendiente Aprobación"], default=["Com Ordem", "Fechada"])
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Cerrar Sesión Operativa"):
+    st.session_state.clear()
+    st.rerun()
 
 # =====================================================================
 # RENDERIZADO LÓGICO
@@ -270,7 +295,6 @@ if opcion_menu == "🏢 Estructura Organizacional":
             else:
                 st.info("No se registran usuarios cargados en el sistema.")
         except Exception as e:
-            # FIX #5: ya no se oculta el error real; se muestra un detalle técnico
             st.info("No se registran usuarios cargados en el sistema.")
             with st.expander("Detalle técnico del error"):
                 st.code(str(e))
@@ -362,7 +386,6 @@ elif opcion_menu == "📥 Mapeador Masivo":
                 with get_db_connection() as conn:
                     with conn.cursor() as cursor:
                         for _, r in df.iterrows():
-                            # FIX #3: RUC y teléfono limpiados con clean_id para evitar "80012345.0"
                             cursor.execute("""
                                 INSERT INTO providers (ruc, name, email, contact_phone)
                                 VALUES (%s, %s, %s, %s) ON CONFLICT (ruc) DO UPDATE SET
@@ -376,19 +399,15 @@ elif opcion_menu == "📥 Mapeador Masivo":
         up_r = st.file_uploader("Arrastra el archivo maestro consolidado aquí", type=["xlsx", "csv"], key="r_up")
         if up_r:
             df = pd.read_excel(up_r) if up_r.name.endswith('xlsx') else pd.read_csv(up_r)
-            if st.button("🚀 Ejecutar Motor de Integridad Correlativa (Cabecera + Detalle)"):
+            if st.button("🚀 Ejecutar Motor de Integridad Correlativa"):
                 with get_db_connection() as conn:
                     with conn.cursor() as cursor:
-                        # FIX #4: antes de re-insertar el detalle, borramos las líneas
-                        # existentes de las requisiciones que vienen en este archivo,
-                        # para que volver a subir el mismo Excel no duplique líneas.
                         codigos_unicos = [clean_id(v) for v in df['Solicitação'].unique()]
                         if codigos_unicos:
                             cursor.execute(
                                 "DELETE FROM requisitions_detalles WHERE requisicion_id = ANY(%s)",
                                 (codigos_unicos,)
                             )
-
                         for _, row in df.iterrows():
                             req_code_val = clean_id(row['Solicitação'])
                             d_aprova = pd.to_datetime(row['Data Aprova']).date() if pd.notnull(row['Data Aprova']) else None
@@ -418,7 +437,11 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
     col_acc1, col_acc2 = st.columns(2)
     with col_acc1:
         st.markdown("### Paso 1: Obtener Plantilla Estructurada")
-        df_detalles_plantilla = pd.read_sql_query("SELECT item_codigo, narrativa_solicitante, cantidad_solicitada FROM requisitions_detalles WHERE requisicion_id = :req", get_engine(), params={"req": c_req_code})
+        df_detalles_plantilla = pd.read_sql_query(
+            "SELECT item_codigo, narrativa_solicitante, cantidad_solicitada FROM requisitions_detalles WHERE requisicion_id = %(req)s", 
+            get_engine(), 
+            params={"req": c_req_code}
+        )
 
         if not df_detalles_plantilla.empty:
             cols_presupuesto = ['proveedor_ruc', 'precio_total_usd', 'plazo_pago_dias', 'tiempo_entrega_dias']
@@ -462,7 +485,7 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
                b.delivery_time_days AS "Tiempo Entrega (Días)"
         FROM budgets b
         LEFT JOIN providers p ON b.provider_ruc = p.ruc
-        WHERE b.req_code = :req
+        WHERE b.req_code = %(req)s
     """, get_engine(), params={"req": c_req_code})
 
     if not df_quotes.empty:
@@ -504,7 +527,11 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
 
         select_req = st.selectbox("Seleccione el código de orden a auditar cantidades:", df_db['req_code'].unique())
 
-        df_detalles = pd.read_sql_query("SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = :req", get_engine(), params={"req": select_req})
+        df_detalles = pd.read_sql_query(
+            "SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = %(req)s", 
+            get_engine(), 
+            params={"req": select_req}
+        )
 
         if not df_detalles.empty:
             st.dataframe(df_detalles, use_container_width=True)
@@ -516,7 +543,7 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
 
                 if st.form_submit_button("Guardar Cambios de Auditoría"):
                     if not justificacion_compra.strip():
-                        st.error("⚠️ Operación Bloqueada: Debe ingresar un motivo válido para alterar las cantidades originales del solicitante.")
+                        st.error("⚠️ Operación Bloqueada: Debe ingresar un motivo válido para alterar las cantidades originales.")
                     else:
                         row_modificada = df_detalles[df_detalles['id'] == id_linea].iloc[0]
                         valor_anterior_cant = str(row_modificada['cantidad_comprador'])
