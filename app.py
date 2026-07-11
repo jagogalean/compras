@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import psycopg
 from psycopg_pool import ConnectionPool
+from sqlalchemy import create_engine
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import plotly.express as px
@@ -73,6 +74,23 @@ def get_db_connection():
     pool_obj = get_connection_pool()
     with pool_obj.connection() as conn:
         yield conn
+
+
+@st.cache_resource
+def get_engine():
+    """Motor de SQLAlchemy dedicado a pd.read_sql_query.
+    FIX #segfault: pasarle a pandas una conexión DBAPI2 cruda de psycopg
+    (en vez de un engine/conexión de SQLAlchemy) no está oficialmente
+    soportado desde pandas 3.0 (solo genera un warning), y en la
+    combinación pandas 3.0 + psycopg 3 + Python 3.14 provocaba un
+    segmentation fault en producción. Usar un engine de SQLAlchemy para
+    las lecturas es la vía soportada y estable."""
+    contrasena = st.secrets["database"]["password"]
+    url = (
+        f"postgresql+psycopg://postgres.cotrwpikrtbwqlmbgixq:{contrasena}"
+        f"@aws-1-sa-east-1.pooler.supabase.com:5432/postgres?sslmode=require"
+    )
+    return create_engine(url, pool_size=5, max_overflow=5, pool_pre_ping=True)
 
 
 def init_db():
@@ -246,8 +264,7 @@ if opcion_menu == "🏢 Estructura Organizacional":
     with tab_usuarios:
         st.subheader("Personal con acceso e Indexación en el Flujo")
         try:
-            with get_db_connection() as conn:
-                df_u = pd.read_sql_query('SELECT nombre AS "Nombre", email AS "Correo Institucional", rol AS "Rol Asignado" FROM usuarios', conn)
+            df_u = pd.read_sql_query('SELECT nombre AS "Nombre", email AS "Correo Institucional", rol AS "Rol Asignado" FROM usuarios', get_engine())
             if not df_u.empty:
                 st.dataframe(df_u, use_container_width=True)
             else:
@@ -261,12 +278,11 @@ if opcion_menu == "🏢 Estructura Organizacional":
     with tab_ruta:
         st.subheader("Flujo de Aprobadores Secuenciales en Cascada")
         try:
-            with get_db_connection() as conn:
-                df_aprob = pd.read_sql_query("""
-                    SELECT nombre AS "Nombre Aprobador", email AS "Correo",
-                           nivel_aprobacion AS "Escalón Jerárquico", secuencia_orden AS "Orden de Firma"
-                    FROM usuarios WHERE rol = 'aprobador' ORDER BY secuencia_orden ASC
-                """, conn)
+            df_aprob = pd.read_sql_query("""
+                SELECT nombre AS "Nombre Aprobador", email AS "Correo",
+                       nivel_aprobacion AS "Escalón Jerárquico", secuencia_orden AS "Orden de Firma"
+                FROM usuarios WHERE rol = 'aprobador' ORDER BY secuencia_orden ASC
+            """, get_engine())
             if not df_aprob.empty:
                 st.dataframe(df_aprob, use_container_width=True)
             else:
@@ -280,12 +296,11 @@ if opcion_menu == "🏢 Estructura Organizacional":
 elif opcion_menu == "🤝 Gestión de Proveedores":
     st.subheader("Directorio Maestro e Indicadores de Operabilidad")
     try:
-        with get_db_connection() as conn:
-            df_prov = pd.read_sql_query("""
-                SELECT ruc AS "RUC", name AS "Razón Social", email AS "Email Comercial",
-                       delivery_score AS "Score Entrega", quality_score AS "Score Calidad"
-                FROM providers
-            """, conn)
+        df_prov = pd.read_sql_query("""
+            SELECT ruc AS "RUC", name AS "Razón Social", email AS "Email Comercial",
+                   delivery_score AS "Score Entrega", quality_score AS "Score Calidad"
+            FROM providers
+        """, get_engine())
         if not df_prov.empty:
             st.dataframe(df_prov, use_container_width=True)
         else:
@@ -403,8 +418,7 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
     col_acc1, col_acc2 = st.columns(2)
     with col_acc1:
         st.markdown("### Paso 1: Obtener Plantilla Estructurada")
-        with get_db_connection() as conn:
-            df_detalles_plantilla = pd.read_sql_query("SELECT item_codigo, narrativa_solicitante, cantidad_solicitada FROM requisitions_detalles WHERE requisicion_id = %s", conn, params=(c_req_code,))
+        df_detalles_plantilla = pd.read_sql_query("SELECT item_codigo, narrativa_solicitante, cantidad_solicitada FROM requisitions_detalles WHERE requisicion_id = :req", get_engine(), params={"req": c_req_code})
 
         if not df_detalles_plantilla.empty:
             cols_presupuesto = ['proveedor_ruc', 'precio_total_usd', 'plazo_pago_dias', 'tiempo_entrega_dias']
@@ -442,15 +456,14 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
 
     st.markdown("---")
     st.subheader(f"Matriz de Comparación Operativa para Requisición: {c_req_code}")
-    with get_db_connection() as conn:
-        df_quotes = pd.read_sql_query("""
-            SELECT b.provider_ruc AS "RUC Proveedor", p.name AS "Razón Social",
-                   b.price AS "Precio USD", b.payment_terms_days AS "Plazo Pago (Días)",
-                   b.delivery_time_days AS "Tiempo Entrega (Días)"
-            FROM budgets b
-            LEFT JOIN providers p ON b.provider_ruc = p.ruc
-            WHERE b.req_code = %s
-        """, conn, params=(c_req_code,))
+    df_quotes = pd.read_sql_query("""
+        SELECT b.provider_ruc AS "RUC Proveedor", p.name AS "Razón Social",
+               b.price AS "Precio USD", b.payment_terms_days AS "Plazo Pago (Días)",
+               b.delivery_time_days AS "Tiempo Entrega (Días)"
+        FROM budgets b
+        LEFT JOIN providers p ON b.provider_ruc = p.ruc
+        WHERE b.req_code = :req
+    """, get_engine(), params={"req": c_req_code})
 
     if not df_quotes.empty:
         st.dataframe(df_quotes, use_container_width=True)
@@ -461,8 +474,7 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
 
 # 5. DASHBOARD EJECUTIVO
 elif opcion_menu == "📊 Dashboard Ejecutivo":
-    with get_db_connection() as conn:
-        df_db = pd.read_sql_query("SELECT * FROM requisitions", conn)
+    df_db = pd.read_sql_query("SELECT * FROM requisitions", get_engine())
 
     if not df_db.empty:
         hoy = datetime.now().date()
@@ -492,8 +504,7 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
 
         select_req = st.selectbox("Seleccione el código de orden a auditar cantidades:", df_db['req_code'].unique())
 
-        with get_db_connection() as conn:
-            df_detalles = pd.read_sql_query("SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = %s", conn, params=(select_req,))
+        df_detalles = pd.read_sql_query("SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = :req", get_engine(), params={"req": select_req})
 
         if not df_detalles.empty:
             st.dataframe(df_detalles, use_container_width=True)
