@@ -162,6 +162,23 @@ def init_db():
                     fecha_cambio TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # --- NUEVO (Requerimiento 7): tabla de reglas de flujo de aprobación ---
+            # Versión simple inicial: guarda condiciones que a futuro pueden usarse
+            # para determinar la secuencia de aprobación requerida según monto/área/
+            # empresa/tipo de compra. No se conecta aún a lógica automática de ruteo;
+            # eso queda para una siguiente iteración según lo indicado en el informe.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS reglas_flujo (
+                    id SERIAL PRIMARY KEY,
+                    monto_min REAL DEFAULT 0,
+                    monto_max REAL,
+                    area_name TEXT,
+                    empresa TEXT,
+                    tipo_compra TEXT,
+                    secuencia_requerida INTEGER DEFAULT 1,
+                    activo BOOLEAN DEFAULT TRUE
+                )
+            """)
 
 try:
     init_db()
@@ -211,22 +228,22 @@ if "authenticated" not in st.session_state:
 if not st.session_state.authenticated:
     st.markdown("<h1 style='text-align: center; color: #1E3A8A; margin-top: 50px;'>Control de Acceso Requerido</h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align: center;'>Identificación obligatoria para ingresar al perímetro de gestión.</p>", unsafe_allow_html=True)
-    
+
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         with st.form("login_form"):
             email_input = st.text_input("Correo Institucional (Identificador de Usuario)")
             password_input = st.text_input("Contraseña de Acceso", type="password")
             submit_btn = st.form_submit_button("Someter a Verificación")
-            
+
             if submit_btn:
                 if not email_input or not password_input:
                     st.error("Denegado: Es obligatorio proveer credenciales completas.")
                 else:
                     try:
                         df_user = pd.read_sql_query(
-                            "SELECT nombre, email, rol FROM usuarios WHERE email = %(email)s", 
-                            get_engine(), 
+                            "SELECT nombre, email, rol FROM usuarios WHERE email = %(email)s",
+                            get_engine(),
                             params={"email": email_input.strip()}
                         )
                         if not df_user.empty:
@@ -251,18 +268,70 @@ st.sidebar.markdown("---")
 
 st.sidebar.subheader("🗂️ Módulos del Sistema")
 
-# Discriminación de menú según el rol
-opciones_permitidas = [
-    "🏢 Estructura Organizacional",
-    "🤝 Gestión de Proveedores",
-    "📥 Mapeador Masivo"
-]
-
-if st.session_state.user_role == "aprobador":
-    opciones_permitidas.extend([
+# --- FIX Bug #5 + NUEVO (Requerimiento 12): Roles y permisos reales ---
+# Antes: "📥 Mapeador Masivo" estaba disponible para CUALQUIER usuario autenticado.
+# Ahora: cada rol tiene un set explícito de menús permitidos. Solo Comprador y
+# Administración ven el Mapeador Masivo (que puede sobrescribir toda la base).
+ROLE_MENU_MAP = {
+    "solicitante": [
+        "🏢 Estructura Organizacional",
+        "🤝 Gestión de Proveedores",
+    ],
+    "jefe de área": [
+        "🏢 Estructura Organizacional",
+        "🤝 Gestión de Proveedores",
         "⚖️ Cuadro Comparativo Masivo",
-        "📊 Dashboard Ejecutivo"
-    ])
+    ],
+    "comprador": [
+        "🏢 Estructura Organizacional",
+        "🤝 Gestión de Proveedores",
+        "📥 Mapeador Masivo",
+        "⚖️ Cuadro Comparativo Masivo",
+        "📊 Dashboard Ejecutivo",
+        "✅ Aprobar / Rechazar",
+    ],
+    "gerencia": [
+        "🏢 Estructura Organizacional",
+        "🤝 Gestión de Proveedores",
+        "⚖️ Cuadro Comparativo Masivo",
+        "📊 Dashboard Ejecutivo",
+        "✅ Aprobar / Rechazar",
+    ],
+    "directorio": [
+        "🏢 Estructura Organizacional",
+        "🤝 Gestión de Proveedores",
+        "⚖️ Cuadro Comparativo Masivo",
+        "📊 Dashboard Ejecutivo",
+        "✅ Aprobar / Rechazar",
+    ],
+    "auditoría": [
+        "🏢 Estructura Organizacional",
+        "🤝 Gestión de Proveedores",
+        "📊 Dashboard Ejecutivo",
+    ],
+    "administración": [
+        "🏢 Estructura Organizacional",
+        "🤝 Gestión de Proveedores",
+        "📥 Mapeador Masivo",
+        "⚖️ Cuadro Comparativo Masivo",
+        "📊 Dashboard Ejecutivo",
+        "✅ Aprobar / Rechazar",
+    ],
+    # Compatibilidad retroactiva: el rol "aprobador" ya está cargado en producción
+    # (tabla usuarios) y no debe perder acceso mientras se migra a los roles nuevos.
+    "aprobador": [
+        "🏢 Estructura Organizacional",
+        "🤝 Gestión de Proveedores",
+        "⚖️ Cuadro Comparativo Masivo",
+        "📊 Dashboard Ejecutivo",
+        "✅ Aprobar / Rechazar",
+    ],
+}
+
+opciones_permitidas = ROLE_MENU_MAP.get(
+    st.session_state.user_role,
+    ["🏢 Estructura Organizacional", "🤝 Gestión de Proveedores"]  # default mínimo seguro para roles no reconocidos
+)
 
 opcion_menu = st.sidebar.radio("Seleccione una sección:", opciones_permitidas)
 
@@ -320,9 +389,13 @@ if opcion_menu == "🏢 Estructura Organizacional":
 elif opcion_menu == "🤝 Gestión de Proveedores":
     st.subheader("Directorio Maestro e Indicadores de Operabilidad")
     try:
+        # --- FIX Bug #4: faltaban flexibility_score, financial_health_score y general_notes ---
         df_prov = pd.read_sql_query("""
             SELECT ruc AS "RUC", name AS "Razón Social", email AS "Email Comercial",
-                   delivery_score AS "Score Entrega", quality_score AS "Score Calidad"
+                   delivery_score AS "Score Entrega", quality_score AS "Score Calidad",
+                   flexibility_score AS "Score Flexibilidad",
+                   financial_health_score AS "Score Salud Financiera",
+                   general_notes AS "Notas Generales"
             FROM providers
         """, get_engine())
         if not df_prov.empty:
@@ -338,8 +411,10 @@ elif opcion_menu == "🤝 Gestión de Proveedores":
 elif opcion_menu == "📥 Mapeador Masivo":
     st.subheader("Carga, Validación e Inicialización Masiva de Registros mediante Excel")
 
-    t_usuarios, t_items, t_prov, t_reqs = st.tabs([
-        "👥 Carga de Usuarios", "📦 Catálogo de Ítems", "🏢 Directorio Proveedores", "📑 Planilla Maestro Requisiciones"
+    # --- FIX Bug #2: se agrega tab de carga para areas_emails ---
+    t_usuarios, t_items, t_prov, t_areas, t_reqs = st.tabs([
+        "👥 Carga de Usuarios", "📦 Catálogo de Ítems", "🏢 Directorio Proveedores",
+        "🗺️ Áreas y Emails", "📑 Planilla Maestro Requisiciones"
     ])
 
     with t_usuarios:
@@ -393,6 +468,24 @@ elif opcion_menu == "📥 Mapeador Masivo":
                             """, (clean_id(r['ruc']), r['name'], r['email'], clean_id(r['contact_phone'])))
                 st.success("Proveedores dados de alta de manera masiva.")
 
+    # --- NUEVO Bug #2: carga masiva de areas_emails (mismo patrón que t_prov) ---
+    with t_areas:
+        cols_a = ['area_name', 'email']
+        st.download_button("📥 Descargar Plantilla Ejemplo (Áreas y Emails)", generar_excel_descarga(cols_a), "ejemplo_areas_emails.xlsx", "application/vnd.ms-excel")
+        up_a = st.file_uploader("Subir planilla de áreas y emails", type=["xlsx", "csv"], key="a_up")
+        if up_a:
+            df = pd.read_excel(up_a) if up_a.name.endswith('xlsx') else pd.read_csv(up_a)
+            if st.button("🚀 Sincronizar Mapeo de Áreas y Emails"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        for _, r in df.iterrows():
+                            cursor.execute("""
+                                INSERT INTO areas_emails (area_name, email)
+                                VALUES (%s, %s) ON CONFLICT (email) DO UPDATE SET
+                                area_name=EXCLUDED.area_name
+                            """, (str(r['area_name']).strip(), str(r['email']).strip()))
+                st.success("Mapeo de áreas y emails actualizado sin duplicados.")
+
     with t_reqs:
         cols_r = ['Solicitação', 'Situação Solici', 'Pedido', 'Data Aprova', 'Data Solicita', 'E-mail Comp', 'E-mail Aprov', 'E-mail Solicit', 'Código Item', 'Narrativa Item', 'Cantidad Solicitada']
         st.download_button("📥 Descargar Estructura Maestro de Compras", generar_excel_descarga(cols_r), "plantilla_maestro.xlsx", "application/vnd.ms-excel")
@@ -402,12 +495,12 @@ elif opcion_menu == "📥 Mapeador Masivo":
             if st.button("🚀 Ejecutar Motor de Integridad Correlativa"):
                 with get_db_connection() as conn:
                     with conn.cursor() as cursor:
-                        codigos_unicos = [clean_id(v) for v in df['Solicitação'].unique()]
-                        if codigos_unicos:
-                            cursor.execute(
-                                "DELETE FROM requisitions_detalles WHERE requisicion_id = ANY(%s)",
-                                (codigos_unicos,)
-                            )
+                        # --- FIX Bug #3: ya NO se hace DELETE masivo de requisitions_detalles.
+                        # El DELETE previo pisaba cantidad_comprador ya auditada por Compras.
+                        # Ahora se hace UPSERT línea por línea: si la línea ya existe y
+                        # cantidad_comprador ya fue modificada por Compras (difiere de la
+                        # cantidad_solicitada original), se preserva. Si nunca fue tocada,
+                        # se actualiza junto con la nueva cantidad solicitada.
                         for _, row in df.iterrows():
                             req_code_val = clean_id(row['Solicitação'])
                             d_aprova = pd.to_datetime(row['Data Aprova']).date() if pd.notnull(row['Data Aprova']) else None
@@ -424,22 +517,64 @@ elif opcion_menu == "📥 Mapeador Masivo":
                             """, (req_code_val, str(row['Situação Solici']), str(row['Pedido']), d_aprova, d_solicita, str(row['E-mail Comp']), str(row['E-mail Aprov']), assigned_area))
 
                             cantidad = safe_int(row['Cantidad Solicitada'])
+                            item_cod = clean_id(row['Código Item'])
+                            narrativa = str(row['Narrativa Item'])
+
                             cursor.execute("""
-                                INSERT INTO requisitions_detalles (requisicion_id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador)
-                                VALUES (%s, %s, %s, %s, %s)
-                            """, (req_code_val, clean_id(row['Código Item']), str(row['Narrativa Item']), cantidad, cantidad))
-                st.success("Estructura transaccional mapeada con total integridad en Supabase.")
+                                SELECT id, cantidad_solicitada, cantidad_comprador
+                                FROM requisitions_detalles
+                                WHERE requisicion_id = %s AND item_codigo = %s
+                            """, (req_code_val, item_cod))
+                            existing = cursor.fetchone()
+
+                            if existing:
+                                existing_id, existing_cant_sol, existing_cant_comp = existing
+                                if existing_cant_comp == existing_cant_sol:
+                                    # Compras nunca auditó esta línea: se sincroniza normalmente
+                                    cursor.execute("""
+                                        UPDATE requisitions_detalles
+                                        SET cantidad_solicitada = %s, narrativa_solicitante = %s, cantidad_comprador = %s
+                                        WHERE id = %s
+                                    """, (cantidad, narrativa, cantidad, existing_id))
+                                else:
+                                    # Compras ya audito cantidad_comprador: se preserva
+                                    cursor.execute("""
+                                        UPDATE requisitions_detalles
+                                        SET cantidad_solicitada = %s, narrativa_solicitante = %s
+                                        WHERE id = %s
+                                    """, (cantidad, narrativa, existing_id))
+                            else:
+                                cursor.execute("""
+                                    INSERT INTO requisitions_detalles (requisicion_id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (req_code_val, item_cod, narrativa, cantidad, cantidad))
+                st.success("Estructura transaccional mapeada con total integridad en Supabase (cantidad_comprador auditada se preserva).")
 
 # 4. CUADRO COMPARATIVO MASIVO Y FLUJO DE APROBACIÓN JERÁRQUICA
 elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
-    c_req_code = st.text_input("Código de Requisición a Gestionar", "14660")
+    # --- FIX Bug #1: se aplica status_filter para acotar qué requisiciones se gestionan aquí ---
+    if status_filter:
+        df_reqs_filtradas = pd.read_sql_query(
+            "SELECT req_code FROM requisitions WHERE situacao_solici = ANY(%(estados)s) ORDER BY req_code",
+            get_engine(), params={"estados": status_filter}
+        )
+    else:
+        df_reqs_filtradas = pd.read_sql_query(
+            "SELECT req_code FROM requisitions ORDER BY req_code", get_engine()
+        )
+    opciones_req = df_reqs_filtradas['req_code'].tolist() if not df_reqs_filtradas.empty else []
+
+    c_req_code = st.selectbox(
+        "Código de Requisición a Gestionar (filtrado por 'Estado General' de la barra lateral)",
+        opciones_req if opciones_req else ["14660"]
+    )
 
     col_acc1, col_acc2 = st.columns(2)
     with col_acc1:
         st.markdown("### Paso 1: Obtener Plantilla Estructurada")
         df_detalles_plantilla = pd.read_sql_query(
-            "SELECT item_codigo, narrativa_solicitante, cantidad_solicitada FROM requisitions_detalles WHERE requisicion_id = %(req)s", 
-            get_engine(), 
+            "SELECT item_codigo, narrativa_solicitante, cantidad_solicitada FROM requisitions_detalles WHERE requisicion_id = %(req)s",
+            get_engine(),
             params={"req": c_req_code}
         )
 
@@ -497,7 +632,14 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
 
 # 5. DASHBOARD EJECUTIVO
 elif opcion_menu == "📊 Dashboard Ejecutivo":
-    df_db = pd.read_sql_query("SELECT * FROM requisitions", get_engine())
+    # --- FIX Bug #1: se aplica status_filter a la query base del dashboard ---
+    if status_filter:
+        df_db = pd.read_sql_query(
+            "SELECT * FROM requisitions WHERE situacao_solici = ANY(%(estados)s)",
+            get_engine(), params={"estados": status_filter}
+        )
+    else:
+        df_db = pd.read_sql_query("SELECT * FROM requisitions", get_engine())
 
     if not df_db.empty:
         hoy = datetime.now().date()
@@ -528,8 +670,8 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
         select_req = st.selectbox("Seleccione el código de orden a auditar cantidades:", df_db['req_code'].unique())
 
         df_detalles = pd.read_sql_query(
-            "SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = %(req)s", 
-            get_engine(), 
+            "SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = %(req)s",
+            get_engine(),
             params={"req": select_req}
         )
 
@@ -559,3 +701,84 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
                         st.rerun()
     else:
         st.info("No se registran datos en la nube.")
+
+# 6. APROBAR / RECHAZAR (NUEVO — Requerimiento 7, flujo de aprobación real)
+elif opcion_menu == "✅ Aprobar / Rechazar":
+    st.subheader("Bandeja de Aprobación Pendiente")
+    st.caption("Se listan las requisiciones donde usted figura como aprobador actual en la cadena secuencial.")
+
+    df_pendientes = pd.read_sql_query("""
+        SELECT req_code, situacao_solici, pedido, area_name, secuencia_aprobacion_actual
+        FROM requisitions
+        WHERE aprobador_actual = %(email)s
+        AND situacao_solici IN ('Pendiente Aprobación', 'En aprobación')
+    """, get_engine(), params={"email": st.session_state.user_email})
+
+    if df_pendientes.empty:
+        st.info("No tiene requisiciones pendientes de su firma en este momento.")
+    else:
+        st.dataframe(df_pendientes, use_container_width=True)
+        req_a_resolver = st.selectbox("Seleccione la requisición a resolver:", df_pendientes['req_code'].tolist())
+
+        col_ap, col_re = st.columns(2)
+
+        with col_ap:
+            st.markdown("**Aprobar**")
+            if st.button("✅ Aprobar Requisición"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT secuencia_aprobacion_actual FROM requisitions WHERE req_code = %s", (req_a_resolver,))
+                        seq_actual = cursor.fetchone()[0]
+
+                        # Busca el siguiente aprobador en la cadena según secuencia_orden
+                        cursor.execute("""
+                            SELECT email FROM usuarios
+                            WHERE rol = 'aprobador' AND secuencia_orden > %s
+                            ORDER BY secuencia_orden ASC LIMIT 1
+                        """, (seq_actual,))
+                        siguiente = cursor.fetchone()
+
+                        if siguiente:
+                            cursor.execute("""
+                                UPDATE requisitions
+                                SET secuencia_aprobacion_actual = secuencia_aprobacion_actual + 1,
+                                    aprobador_actual = %s,
+                                    situacao_solici = 'En aprobación'
+                                WHERE req_code = %s
+                            """, (siguiente[0], req_a_resolver))
+                            nuevo_estado = 'En aprobación'
+                        else:
+                            # Era el último aprobador de la cadena
+                            cursor.execute("""
+                                UPDATE requisitions
+                                SET situacao_solici = 'Aprobada'
+                                WHERE req_code = %s
+                            """, (req_a_resolver,))
+                            nuevo_estado = 'Aprobada'
+
+                        cursor.execute("""
+                            INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (req_a_resolver, 'situacao_solici', 'Pendiente Aprobación', nuevo_estado,
+                              f"Aprobado por {st.session_state.user_email}"))
+                st.success(f"Requisición {req_a_resolver} avanzada. Nuevo estado: {nuevo_estado}")
+                st.rerun()
+
+        with col_re:
+            st.markdown("**Rechazar**")
+            motivo_rechazo = st.text_area("Motivo del rechazo (obligatorio)", key="motivo_rechazo")
+            if st.button("❌ Rechazar Requisición"):
+                if not motivo_rechazo.strip():
+                    st.error("⚠️ Debe ingresar un motivo para rechazar la requisición.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                UPDATE requisitions SET situacao_solici = 'Rechazada' WHERE req_code = %s
+                            """, (req_a_resolver,))
+                            cursor.execute("""
+                                INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                VALUES (%s, %s, %s, %s, %s)
+                            """, (req_a_resolver, 'situacao_solici', 'Pendiente Aprobación', 'Rechazada', motivo_rechazo))
+                    st.success(f"Requisición {req_a_resolver} rechazada y registrada en trazabilidad.")
+                    st.rerun()
