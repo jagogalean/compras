@@ -180,6 +180,76 @@ def init_db():
                 )
             """)
 
+            # --- NUEVO (Fase 4 y 5): columnas adicionales, agregadas de forma NO
+            # destructiva con ADD COLUMN IF NOT EXISTS. No se toca ningún dato existente.
+            cursor.execute("ALTER TABLE requisitions ADD COLUMN IF NOT EXISTS empresa_ruc TEXT")
+            cursor.execute("ALTER TABLE requisitions ADD COLUMN IF NOT EXISTS fecha_comprometida DATE")
+            cursor.execute("ALTER TABLE requisitions_detalles ADD COLUMN IF NOT EXISTS cantidad_recibida INTEGER DEFAULT 0")
+            cursor.execute("ALTER TABLE requisitions_detalles ADD COLUMN IF NOT EXISTS estado_recepcion TEXT DEFAULT 'Pendiente'")
+
+            # --- NUEVO (Requerimiento 4): Empresa Compradora (16 RUC distintos) ---
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS empresas_compradoras (
+                    id SERIAL PRIMARY KEY,
+                    ruc TEXT UNIQUE,
+                    razon_social TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS historial_empresa_compradora (
+                    id SERIAL PRIMARY KEY,
+                    req_code TEXT,
+                    empresa_ruc_anterior TEXT,
+                    empresa_ruc_nuevo TEXT,
+                    usuario TEXT,
+                    motivo TEXT,
+                    fecha_cambio TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # --- NUEVO (Requerimiento 9): Gestión documental ---
+            # MVP: se guarda el contenido como BYTEA directamente en Postgres para no
+            # sumar una dependencia nueva (supabase-py / Storage SDK). Si más adelante
+            # se prefiere Supabase Storage, se puede migrar sin tocar la interfaz.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS documentos_adjuntos (
+                    id SERIAL PRIMARY KEY,
+                    requisicion_id TEXT,
+                    nombre_archivo TEXT,
+                    tipo_documento TEXT,
+                    contenido BYTEA,
+                    subido_por TEXT,
+                    fecha_subida TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # --- NUEVO (Requerimiento 10): Notificaciones automáticas ---
+            # MVP: log de notificaciones pendientes en base de datos (no envío de email real,
+            # tal como habilita el informe: "como mínimo un log de notificaciones pendientes").
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS notificaciones_pendientes (
+                    id SERIAL PRIMARY KEY,
+                    requisicion_id TEXT,
+                    tipo_evento TEXT,
+                    mensaje TEXT,
+                    fecha_generada TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    leida BOOLEAN DEFAULT FALSE
+                )
+            """)
+
+            # --- NUEVO (recomendado): Control de presupuesto disponible ---
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS presupuestos_area (
+                    id SERIAL PRIMARY KEY,
+                    area_name TEXT,
+                    empresa_ruc TEXT,
+                    monto_asignado REAL DEFAULT 0,
+                    monto_utilizado REAL DEFAULT 0,
+                    periodo TEXT,
+                    UNIQUE(area_name, empresa_ruc, periodo)
+                )
+            """)
+
 try:
     init_db()
 except Exception as e:
@@ -210,10 +280,27 @@ def call_mock_llm(prompt_type, data):
 
 def generar_excel_descarga(columnas, data=None):
     output = io.BytesIO()
-    df = pd.DataFrame(data, columns=columnas) if data else pd.DataFrame(columns=columnas)
+    df = pd.DataFrame(data, columns=columnas) if data else pd.DataFrame(columnas)
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Plantilla Modelo')
     return output.getvalue()
+
+# --- NUEVO (Requerimiento 5): set completo de estados del proceso ---
+# Reemplaza el uso de texto libre en situacao_solici. Se mantiene compatibilidad
+# con valores ya cargados en producción (ver sidebar, que fusiona estos con los
+# que ya existan en la base) para no romper filtros de datos históricos.
+ESTADOS_VALIDOS = [
+    "Borrador", "Pendiente de aprobación", "En aprobación", "Aprobada", "Rechazada",
+    "En cotización", "En negociación", "Orden de Compra emitida", "Parcialmente atendida",
+    "Recepción parcial", "Recepción completa", "Cerrada", "Cancelada", "Anulada"
+]
+
+# --- NUEVO (Requerimiento 10): helper de notificaciones automáticas (log mínimo) ---
+def registrar_notificacion(cursor, req_code, tipo_evento, mensaje):
+    cursor.execute("""
+        INSERT INTO notificaciones_pendientes (requisicion_id, tipo_evento, mensaje)
+        VALUES (%s, %s, %s)
+    """, (req_code, tipo_evento, mensaje))
 
 
 # =====================================================================
@@ -276,19 +363,26 @@ ROLE_MENU_MAP = {
     "solicitante": [
         "🏢 Estructura Organizacional",
         "🤝 Gestión de Proveedores",
+        "📝 Nueva Solicitud",
+        "🔍 Buscador Rápido",
     ],
     "jefe de área": [
         "🏢 Estructura Organizacional",
         "🤝 Gestión de Proveedores",
+        "📝 Nueva Solicitud",
         "⚖️ Cuadro Comparativo Masivo",
+        "🔍 Buscador Rápido",
     ],
     "comprador": [
         "🏢 Estructura Organizacional",
         "🤝 Gestión de Proveedores",
         "📥 Mapeador Masivo",
         "⚖️ Cuadro Comparativo Masivo",
+        "🛠️ Control de Compras",
         "📊 Dashboard Ejecutivo",
         "✅ Aprobar / Rechazar",
+        "🔍 Buscador Rápido",
+        "🔔 Notificaciones",
     ],
     "gerencia": [
         "🏢 Estructura Organizacional",
@@ -296,6 +390,8 @@ ROLE_MENU_MAP = {
         "⚖️ Cuadro Comparativo Masivo",
         "📊 Dashboard Ejecutivo",
         "✅ Aprobar / Rechazar",
+        "🔍 Buscador Rápido",
+        "🔔 Notificaciones",
     ],
     "directorio": [
         "🏢 Estructura Organizacional",
@@ -303,19 +399,26 @@ ROLE_MENU_MAP = {
         "⚖️ Cuadro Comparativo Masivo",
         "📊 Dashboard Ejecutivo",
         "✅ Aprobar / Rechazar",
+        "🔍 Buscador Rápido",
+        "🔔 Notificaciones",
     ],
     "auditoría": [
         "🏢 Estructura Organizacional",
         "🤝 Gestión de Proveedores",
         "📊 Dashboard Ejecutivo",
+        "🔍 Buscador Rápido",
+        "🔔 Notificaciones",
     ],
     "administración": [
         "🏢 Estructura Organizacional",
         "🤝 Gestión de Proveedores",
         "📥 Mapeador Masivo",
         "⚖️ Cuadro Comparativo Masivo",
+        "🛠️ Control de Compras",
         "📊 Dashboard Ejecutivo",
         "✅ Aprobar / Rechazar",
+        "🔍 Buscador Rápido",
+        "🔔 Notificaciones",
     ],
     # Compatibilidad retroactiva: el rol "aprobador" ya está cargado en producción
     # (tabla usuarios) y no debe perder acceso mientras se migra a los roles nuevos.
@@ -325,6 +428,7 @@ ROLE_MENU_MAP = {
         "⚖️ Cuadro Comparativo Masivo",
         "📊 Dashboard Ejecutivo",
         "✅ Aprobar / Rechazar",
+        "🔍 Buscador Rápido",
     ],
 }
 
@@ -337,7 +441,22 @@ opcion_menu = st.sidebar.radio("Seleccione una sección:", opciones_permitidas)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎛️ Filtros Gerenciales")
-status_filter = st.sidebar.multiselect("Estado General", ["Com Ordem", "Fechada", "Pendiente Aprobación"], default=["Com Ordem", "Fechada"])
+# --- FIX Bug #1 (mejora): el listado de estados ya no es una lista fija hardcodeada.
+# Se fusiona ESTADOS_VALIDOS (Requerimiento 5) con los valores que ya existan
+# realmente en la base (legado), para que el filtro nunca quede desactualizado
+# ni oculte datos históricos con nomenclatura anterior.
+try:
+    df_estados_existentes = pd.read_sql_query(
+        "SELECT DISTINCT situacao_solici FROM requisitions WHERE situacao_solici IS NOT NULL", get_engine()
+    )
+    estados_disponibles = sorted(set(df_estados_existentes['situacao_solici'].tolist()) | set(ESTADOS_VALIDOS))
+except Exception:
+    estados_disponibles = ESTADOS_VALIDOS
+
+status_filter = st.sidebar.multiselect(
+    "Estado General", estados_disponibles,
+    default=[e for e in estados_disponibles if e in ("Com Ordem", "Fechada")] or estados_disponibles[:2]
+)
 
 st.sidebar.markdown("---")
 if st.sidebar.button("Cerrar Sesión Operativa"):
@@ -411,10 +530,11 @@ elif opcion_menu == "🤝 Gestión de Proveedores":
 elif opcion_menu == "📥 Mapeador Masivo":
     st.subheader("Carga, Validación e Inicialización Masiva de Registros mediante Excel")
 
-    # --- FIX Bug #2: se agrega tab de carga para areas_emails ---
-    t_usuarios, t_items, t_prov, t_areas, t_reqs = st.tabs([
+    # --- FIX Bug #2 + NUEVO (Requerimiento 4 y recomendado de presupuesto) ---
+    t_usuarios, t_items, t_prov, t_areas, t_empresas, t_presu, t_reqs = st.tabs([
         "👥 Carga de Usuarios", "📦 Catálogo de Ítems", "🏢 Directorio Proveedores",
-        "🗺️ Áreas y Emails", "📑 Planilla Maestro Requisiciones"
+        "🗺️ Áreas y Emails", "🏦 Empresas Compradoras", "💰 Presupuestos",
+        "📑 Planilla Maestro Requisiciones"
     ])
 
     with t_usuarios:
@@ -485,6 +605,44 @@ elif opcion_menu == "📥 Mapeador Masivo":
                                 area_name=EXCLUDED.area_name
                             """, (str(r['area_name']).strip(), str(r['email']).strip()))
                 st.success("Mapeo de áreas y emails actualizado sin duplicados.")
+
+    # --- NUEVO (Requerimiento 4): carga masiva de Empresas Compradoras (16 RUC) ---
+    with t_empresas:
+        cols_emp = ['ruc', 'razon_social']
+        st.download_button("📥 Descargar Plantilla Ejemplo (Empresas Compradoras)", generar_excel_descarga(cols_emp), "ejemplo_empresas_compradoras.xlsx", "application/vnd.ms-excel")
+        up_emp = st.file_uploader("Subir planilla de empresas compradoras", type=["xlsx", "csv"], key="emp_up")
+        if up_emp:
+            df = pd.read_excel(up_emp) if up_emp.name.endswith('xlsx') else pd.read_csv(up_emp)
+            if st.button("🚀 Sincronizar Empresas Compradoras"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        for _, r in df.iterrows():
+                            cursor.execute("""
+                                INSERT INTO empresas_compradoras (ruc, razon_social)
+                                VALUES (%s, %s) ON CONFLICT (ruc) DO UPDATE SET
+                                razon_social=EXCLUDED.razon_social
+                            """, (clean_id(r['ruc']), str(r['razon_social']).strip()))
+                st.success("Empresas compradoras sincronizadas.")
+
+    # --- NUEVO (recomendado): carga masiva de Presupuestos por Área ---
+    with t_presu:
+        cols_pres = ['area_name', 'empresa_ruc', 'monto_asignado', 'monto_utilizado', 'periodo']
+        st.download_button("📥 Descargar Plantilla Ejemplo (Presupuestos)", generar_excel_descarga(cols_pres), "ejemplo_presupuestos.xlsx", "application/vnd.ms-excel")
+        up_pres = st.file_uploader("Subir planilla de presupuestos", type=["xlsx", "csv"], key="pres_up")
+        if up_pres:
+            df = pd.read_excel(up_pres) if up_pres.name.endswith('xlsx') else pd.read_csv(up_pres)
+            if st.button("🚀 Sincronizar Presupuestos"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        for _, r in df.iterrows():
+                            cursor.execute("""
+                                INSERT INTO presupuestos_area (area_name, empresa_ruc, monto_asignado, monto_utilizado, periodo)
+                                VALUES (%s, %s, %s, %s, %s)
+                                ON CONFLICT (area_name, empresa_ruc, periodo) DO UPDATE SET
+                                monto_asignado=EXCLUDED.monto_asignado, monto_utilizado=EXCLUDED.monto_utilizado
+                            """, (str(r['area_name']).strip(), clean_id(r['empresa_ruc']),
+                                  float(r['monto_asignado']), float(r['monto_utilizado']), str(r['periodo']).strip()))
+                st.success("Presupuestos por área sincronizados.")
 
     with t_reqs:
         cols_r = ['Solicitação', 'Situação Solici', 'Pedido', 'Data Aprova', 'Data Solicita', 'E-mail Comp', 'E-mail Aprov', 'E-mail Solicit', 'Código Item', 'Narrativa Item', 'Cantidad Solicitada']
@@ -610,6 +768,9 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
                             secuencia_aprobacion_actual = 1
                             WHERE req_code = %s
                         """, (c_req_code,))
+                        # NUEVO (Requerimiento 10): notificación mínima de evento
+                        registrar_notificacion(cursor, c_req_code, 'pendiente_aprobacion',
+                                                f"La requisición {c_req_code} quedó pendiente de aprobación tras cargar cotizaciones.")
                 st.success("Ofertas indexadas. La requisición avanzó a la ruta crítica del 'Aprobador 1'.")
 
     st.markdown("---")
@@ -663,6 +824,49 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
         with g2:
             fig_aprov = px.histogram(df_db, x='aprobador_actual', title="Carga Dinámica de Órdenes Retenidas por Autorizante")
             st.plotly_chart(fig_aprov, use_container_width=True)
+
+        # --- NUEVO (Requerimiento 11): Reportes e indicadores ampliados ---
+        st.markdown("---")
+        st.subheader("📈 Reportes Ampliados")
+        rep1, rep2 = st.columns(2)
+        with rep1:
+            df_compras_area = df_db.groupby('area_name').size().reset_index(name='cantidad')
+            fig_area_rep = px.bar(df_compras_area, x='area_name', y='cantidad', title="Compras por Área")
+            st.plotly_chart(fig_area_rep, use_container_width=True)
+        with rep2:
+            df_compras_comprador = df_db.groupby('analista_email').size().reset_index(name='cantidad')
+            fig_comprador_rep = px.bar(df_compras_comprador, x='analista_email', y='cantidad', title="Compras por Comprador Responsable")
+            st.plotly_chart(fig_comprador_rep, use_container_width=True)
+
+        if 'empresa_ruc' in df_db.columns and df_db['empresa_ruc'].notna().any():
+            df_compras_empresa = df_db.dropna(subset=['empresa_ruc']).groupby('empresa_ruc').size().reset_index(name='cantidad')
+            fig_empresa_rep = px.bar(df_compras_empresa, x='empresa_ruc', y='cantidad', title="Compras por Empresa Compradora")
+            st.plotly_chart(fig_empresa_rep, use_container_width=True)
+
+        # Órdenes vencidas: fecha_comprometida ya pasada y sin recepción completa
+        if 'fecha_comprometida' in df_db.columns:
+            fechas_compr = pd.to_datetime(df_db['fecha_comprometida'], errors='coerce').dt.date
+            vencidas_mask = fechas_compr.notna() & (fechas_compr < hoy)
+            st.metric("📌 Órdenes con Fecha Comprometida Vencida", int(vencidas_mask.sum()))
+
+        # Exportación real a Excel (Requerimiento 11)
+        output_rep = io.BytesIO()
+        with pd.ExcelWriter(output_rep, engine='xlsxwriter') as writer:
+            df_db.drop(columns=['data_aprova_dt'], errors='ignore').to_excel(writer, index=False, sheet_name='Reporte Requisiciones')
+        st.download_button("📥 Exportar Reporte Completo a Excel", output_rep.getvalue(), "reporte_requisiciones.xlsx", "application/vnd.ms-excel")
+
+        # --- NUEVO (recomendado): Alertas de compras duplicadas ---
+        st.markdown("---")
+        st.subheader("⚠️ Alertas de Posibles Compras Duplicadas")
+        df_dupes = pd.read_sql_query("""
+            SELECT item_codigo, requisicion_id, COUNT(*) OVER (PARTITION BY item_codigo) AS repeticiones
+            FROM requisitions_detalles
+        """, get_engine())
+        df_dupes_flag = df_dupes[df_dupes['repeticiones'] > 1]
+        if not df_dupes_flag.empty:
+            st.dataframe(df_dupes_flag, use_container_width=True)
+        else:
+            st.caption("No se detectaron ítems solicitados en múltiples requisiciones.")
 
         st.markdown("---")
         st.subheader("🛠️ Auditoría y Modificación de Cantidades por Compras")
@@ -761,6 +965,8 @@ elif opcion_menu == "✅ Aprobar / Rechazar":
                             VALUES (%s, %s, %s, %s, %s)
                         """, (req_a_resolver, 'situacao_solici', 'Pendiente Aprobación', nuevo_estado,
                               f"Aprobado por {st.session_state.user_email}"))
+                        registrar_notificacion(cursor, req_a_resolver, 'aprobacion_avanzada',
+                                                f"La requisición {req_a_resolver} avanzó a estado '{nuevo_estado}'.")
                 st.success(f"Requisición {req_a_resolver} avanzada. Nuevo estado: {nuevo_estado}")
                 st.rerun()
 
@@ -780,5 +986,461 @@ elif opcion_menu == "✅ Aprobar / Rechazar":
                                 INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
                                 VALUES (%s, %s, %s, %s, %s)
                             """, (req_a_resolver, 'situacao_solici', 'Pendiente Aprobación', 'Rechazada', motivo_rechazo))
+                            registrar_notificacion(cursor, req_a_resolver, 'rechazo',
+                                                    f"La requisición {req_a_resolver} fue rechazada. Motivo: {motivo_rechazo}")
                     st.success(f"Requisición {req_a_resolver} rechazada y registrada en trazabilidad.")
                     st.rerun()
+
+# 7. NUEVA SOLICITUD (NUEVO — Requerimiento 2)
+elif opcion_menu == "📝 Nueva Solicitud":
+    st.subheader("Crear Nueva Solicitud de Compra")
+    st.caption("Una vez enviada, la solicitud queda bloqueada para el Solicitante: cualquier cambio "
+               "(cantidades, ítems, cancelación) debe canalizarse a través de Compras (ver 'Control de Compras').")
+
+    with st.form("form_nueva_solicitud"):
+        area_sol = st.text_input("Área / Centro de Costo")
+        items_disponibles = pd.read_sql_query("SELECT codigo, descripcion_estandar FROM items", get_engine())
+        item_sol = st.selectbox("Ítem", items_disponibles['codigo'].tolist() if not items_disponibles.empty else [])
+        cantidad_sol = st.number_input("Cantidad solicitada", min_value=1, value=1)
+        narrativa_sol = st.text_area("Descripción / narrativa de la necesidad")
+
+        if st.form_submit_button("📨 Enviar Solicitud"):
+            if not item_sol:
+                st.error("No hay ítems cargados en el catálogo todavía.")
+            else:
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        # NUEVO (recomendado): numeración automática de solicitudes
+                        cursor.execute("SELECT req_code FROM requisitions ORDER BY req_code DESC LIMIT 1")
+                        ultimo = cursor.fetchone()
+                        try:
+                            siguiente_num = int(ultimo[0]) + 1 if ultimo and str(ultimo[0]).isdigit() else 100000
+                        except (ValueError, TypeError):
+                            siguiente_num = 100000
+                        nuevo_req_code = str(siguiente_num)
+
+                        cursor.execute("""
+                            INSERT INTO requisitions (req_code, situacao_solici, pedido, data_solicita, analista_email, area_name)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                        """, (nuevo_req_code, 'Borrador', '0', datetime.now().date(),
+                              st.session_state.user_email, area_sol or "Pendiente de Clasificación"))
+
+                        cursor.execute("""
+                            INSERT INTO requisitions_detalles (requisicion_id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (nuevo_req_code, item_sol, narrativa_sol, cantidad_sol, cantidad_sol))
+
+                        cursor.execute("""
+                            INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (nuevo_req_code, 'creacion_solicitud', '-', 'Borrador', f"Creada por {st.session_state.user_email}"))
+
+                        registrar_notificacion(cursor, nuevo_req_code, 'solicitud_creada',
+                                                f"Nueva solicitud {nuevo_req_code} creada por {st.session_state.user_email}")
+                st.success(f"✅ Solicitud creada con el código **{nuevo_req_code}**. Ya no puede modificarla desde aquí.")
+
+# 8. CONTROL DE COMPRAS (NUEVO — Requerimiento 3, 4, 5, 9 y recepción/fechas)
+elif opcion_menu == "🛠️ Control de Compras":
+    st.subheader("Control Exclusivo de Compras sobre Requisiciones")
+    ctrl_req_code = st.text_input("Código de Requisición a intervenir", "14660", key="ctrl_req")
+
+    tab_items, tab_prov_resp, tab_empresa, tab_estado, tab_consolida, tab_docs, tab_recepcion = st.tabs([
+        "📦 Ítems", "🤝 Proveedor / Responsable", "🏦 Empresa Compradora",
+        "🔄 Estado", "🔀 Consolidar / Dividir OC", "📎 Documentos", "📥 Recepción"
+    ])
+
+    # --- Req. 3: eliminar / agregar / sustituir / modificar especificaciones ---
+    with tab_items:
+        df_det_ctrl = pd.read_sql_query(
+            "SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = %(req)s",
+            get_engine(), params={"req": ctrl_req_code}
+        )
+        st.dataframe(df_det_ctrl, use_container_width=True)
+
+        accion_item = st.selectbox("Acción sobre ítems", [
+            "Agregar ítem adicional", "Eliminar ítem", "Sustituir por equivalente", "Modificar especificaciones técnicas"
+        ])
+
+        if accion_item == "Agregar ítem adicional":
+            with st.form("form_agregar_item"):
+                df_catalogo = pd.read_sql_query("SELECT codigo, descripcion_estandar FROM items", get_engine())
+                nuevo_codigo = st.selectbox("Ítem del catálogo", df_catalogo['codigo'].tolist() if not df_catalogo.empty else [])
+                nueva_cant = st.number_input("Cantidad", min_value=1, value=1)
+                motivo_add = st.text_area("Motivo de la adición (obligatorio)")
+                if st.form_submit_button("➕ Agregar Ítem"):
+                    if not motivo_add.strip():
+                        st.error("Debe indicar un motivo.")
+                    else:
+                        with get_db_connection() as conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute("""
+                                    INSERT INTO requisitions_detalles (requisicion_id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (ctrl_req_code, nuevo_codigo, "Agregado por Compras", nueva_cant, nueva_cant))
+                                cursor.execute("""
+                                    INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (ctrl_req_code, 'item_agregado', '-', nuevo_codigo, motivo_add))
+                        st.success("Ítem agregado y registrado en trazabilidad.")
+                        st.rerun()
+
+        elif accion_item == "Eliminar ítem":
+            if not df_det_ctrl.empty:
+                with st.form("form_eliminar_item"):
+                    id_a_borrar = st.selectbox("Línea a eliminar (ID)", df_det_ctrl['id'].tolist())
+                    motivo_del = st.text_area("Motivo de la eliminación (obligatorio)")
+                    if st.form_submit_button("🗑️ Eliminar Ítem"):
+                        if not motivo_del.strip():
+                            st.error("Debe indicar un motivo.")
+                        else:
+                            codigo_borrado = df_det_ctrl[df_det_ctrl['id'] == id_a_borrar].iloc[0]['item_codigo']
+                            with get_db_connection() as conn:
+                                with conn.cursor() as cursor:
+                                    cursor.execute("DELETE FROM requisitions_detalles WHERE id = %s", (id_a_borrar,))
+                                    cursor.execute("""
+                                        INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                        VALUES (%s, %s, %s, %s, %s)
+                                    """, (ctrl_req_code, 'item_eliminado', codigo_borrado, '-', motivo_del))
+                            st.success("Ítem eliminado y registrado en trazabilidad.")
+                            st.rerun()
+            else:
+                st.info("No hay ítems para eliminar.")
+
+        elif accion_item == "Sustituir por equivalente":
+            if not df_det_ctrl.empty:
+                with st.form("form_sustituir_item"):
+                    id_a_sustituir = st.selectbox("Línea a sustituir (ID)", df_det_ctrl['id'].tolist())
+                    df_catalogo2 = pd.read_sql_query("SELECT codigo, descripcion_estandar FROM items", get_engine())
+                    nuevo_codigo_sust = st.selectbox("Nuevo ítem equivalente", df_catalogo2['codigo'].tolist() if not df_catalogo2.empty else [])
+                    motivo_sust = st.text_area("Motivo de la sustitución (obligatorio)")
+                    if st.form_submit_button("🔁 Sustituir Ítem"):
+                        if not motivo_sust.strip():
+                            st.error("Debe indicar un motivo.")
+                        else:
+                            codigo_anterior = df_det_ctrl[df_det_ctrl['id'] == id_a_sustituir].iloc[0]['item_codigo']
+                            with get_db_connection() as conn:
+                                with conn.cursor() as cursor:
+                                    cursor.execute("UPDATE requisitions_detalles SET item_codigo = %s WHERE id = %s", (nuevo_codigo_sust, id_a_sustituir))
+                                    cursor.execute("""
+                                        INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                        VALUES (%s, %s, %s, %s, %s)
+                                    """, (ctrl_req_code, 'item_sustituido', codigo_anterior, nuevo_codigo_sust, motivo_sust))
+                            st.success("Ítem sustituido y registrado en trazabilidad.")
+                            st.rerun()
+            else:
+                st.info("No hay ítems para sustituir.")
+
+        elif accion_item == "Modificar especificaciones técnicas":
+            if not df_det_ctrl.empty:
+                with st.form("form_modif_specs"):
+                    id_a_modif = st.selectbox("Línea a modificar (ID)", df_det_ctrl['id'].tolist())
+                    nueva_narrativa = st.text_area("Nueva especificación técnica / narrativa")
+                    motivo_specs = st.text_area("Motivo del cambio (obligatorio)", key="motivo_specs")
+                    if st.form_submit_button("✏️ Guardar Especificaciones"):
+                        if not motivo_specs.strip():
+                            st.error("Debe indicar un motivo.")
+                        else:
+                            narrativa_anterior = df_det_ctrl[df_det_ctrl['id'] == id_a_modif].iloc[0]['narrativa_solicitante']
+                            with get_db_connection() as conn:
+                                with conn.cursor() as cursor:
+                                    cursor.execute("UPDATE requisitions_detalles SET narrativa_solicitante = %s WHERE id = %s", (nueva_narrativa, id_a_modif))
+                                    cursor.execute("""
+                                        INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                        VALUES (%s, %s, %s, %s, %s)
+                                    """, (ctrl_req_code, 'especificacion_tecnica', str(narrativa_anterior), nueva_narrativa, motivo_specs))
+                            st.success("Especificaciones actualizadas y registradas en trazabilidad.")
+                            st.rerun()
+            else:
+                st.info("No hay ítems para modificar.")
+
+    # --- Req. 3: cambiar proveedor asignado / reasignar responsable ---
+    with tab_prov_resp:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Cambiar Proveedor Asignado**")
+            df_provs = pd.read_sql_query("SELECT ruc, name FROM providers", get_engine())
+            with st.form("form_cambiar_proveedor"):
+                nuevo_ruc = st.selectbox("Nuevo proveedor", df_provs['ruc'].tolist() if not df_provs.empty else [])
+                motivo_prov = st.text_area("Motivo (obligatorio)", key="motivo_prov")
+                if st.form_submit_button("Guardar Proveedor Asignado"):
+                    if not motivo_prov.strip():
+                        st.error("Debe indicar un motivo.")
+                    else:
+                        with get_db_connection() as conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute("UPDATE budgets SET seleccionado = FALSE WHERE req_code = %s", (ctrl_req_code,))
+                                cursor.execute("UPDATE budgets SET seleccionado = TRUE WHERE req_code = %s AND provider_ruc = %s", (ctrl_req_code, nuevo_ruc))
+                                cursor.execute("""
+                                    INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (ctrl_req_code, 'proveedor_asignado', '-', nuevo_ruc, motivo_prov))
+                        st.success("Proveedor asignado actualizado.")
+                        st.rerun()
+
+        with col_b:
+            st.markdown("**Reasignar Responsable / Comprador**")
+            df_compradores = pd.read_sql_query("SELECT email, nombre FROM usuarios WHERE rol IN ('comprador','administración','aprobador')", get_engine())
+            with st.form("form_reasignar"):
+                nuevo_resp = st.selectbox("Nuevo comprador responsable", df_compradores['email'].tolist() if not df_compradores.empty else [])
+                motivo_resp = st.text_area("Motivo (obligatorio)", key="motivo_resp")
+                if st.form_submit_button("Guardar Reasignación"):
+                    if not motivo_resp.strip():
+                        st.error("Debe indicar un motivo.")
+                    else:
+                        with get_db_connection() as conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute("SELECT analista_email FROM requisitions WHERE req_code = %s", (ctrl_req_code,))
+                                anterior = cursor.fetchone()
+                                anterior_val = anterior[0] if anterior else "-"
+                                cursor.execute("UPDATE requisitions SET analista_email = %s WHERE req_code = %s", (nuevo_resp, ctrl_req_code))
+                                cursor.execute("""
+                                    INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (ctrl_req_code, 'responsable_comprador', anterior_val, nuevo_resp, motivo_resp))
+                        st.success("Responsable reasignado.")
+                        st.rerun()
+
+    # --- Req. 4: Empresa Compradora + historial + control de presupuesto informativo ---
+    with tab_empresa:
+        df_empresas = pd.read_sql_query("SELECT ruc, razon_social FROM empresas_compradoras", get_engine())
+        if df_empresas.empty:
+            st.warning("No hay empresas compradoras cargadas. Súbalas en Mapeador Masivo → Empresas Compradoras.")
+        else:
+            df_emp_actual = pd.read_sql_query("SELECT empresa_ruc, area_name FROM requisitions WHERE req_code = %(req)s", get_engine(), params={"req": ctrl_req_code})
+            empresa_actual = df_emp_actual.iloc[0]['empresa_ruc'] if not df_emp_actual.empty and pd.notnull(df_emp_actual.iloc[0]['empresa_ruc']) else "Sin asignar"
+            area_actual = df_emp_actual.iloc[0]['area_name'] if not df_emp_actual.empty else None
+            st.markdown(f"**Empresa compradora actual:** {empresa_actual}")
+
+            with st.form("form_empresa_compradora"):
+                nueva_empresa = st.selectbox("Empresa compradora", df_empresas['ruc'].tolist())
+                motivo_emp = st.text_area("Motivo del cambio (obligatorio)")
+                if st.form_submit_button("Guardar Empresa Compradora"):
+                    if not motivo_emp.strip():
+                        st.error("Debe indicar un motivo.")
+                    else:
+                        with get_db_connection() as conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute("UPDATE requisitions SET empresa_ruc = %s WHERE req_code = %s", (nueva_empresa, ctrl_req_code))
+                                cursor.execute("""
+                                    INSERT INTO historial_empresa_compradora (req_code, empresa_ruc_anterior, empresa_ruc_nuevo, usuario, motivo)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (ctrl_req_code, str(empresa_actual), nueva_empresa, st.session_state.user_email, motivo_emp))
+                                cursor.execute("""
+                                    INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (ctrl_req_code, 'empresa_compradora', str(empresa_actual), nueva_empresa, motivo_emp))
+                        st.success("Empresa compradora actualizada.")
+                        st.rerun()
+
+            df_hist_emp = pd.read_sql_query(
+                "SELECT empresa_ruc_anterior, empresa_ruc_nuevo, usuario, motivo, fecha_cambio FROM historial_empresa_compradora WHERE req_code = %(req)s ORDER BY fecha_cambio DESC",
+                get_engine(), params={"req": ctrl_req_code}
+            )
+            if not df_hist_emp.empty:
+                st.markdown("**Historial de cambios de empresa compradora**")
+                st.dataframe(df_hist_emp, use_container_width=True)
+
+            # NUEVO (recomendado): control de presupuesto disponible — informativo en esta iteración
+            if area_actual:
+                df_presu = pd.read_sql_query(
+                    "SELECT empresa_ruc, monto_asignado, monto_utilizado, periodo FROM presupuestos_area WHERE area_name = %(a)s ORDER BY periodo DESC",
+                    get_engine(), params={"a": area_actual}
+                )
+                if not df_presu.empty:
+                    df_presu['disponible'] = df_presu['monto_asignado'] - df_presu['monto_utilizado']
+                    st.markdown("**💰 Presupuesto disponible para el área** (informativo — no bloquea la emisión de OC en esta versión)")
+                    st.dataframe(df_presu, use_container_width=True)
+
+    # --- Req. 5: Estados del proceso ---
+    with tab_estado:
+        df_estado_actual = pd.read_sql_query("SELECT situacao_solici FROM requisitions WHERE req_code = %(req)s", get_engine(), params={"req": ctrl_req_code})
+        estado_actual = df_estado_actual.iloc[0]['situacao_solici'] if not df_estado_actual.empty else "Sin datos"
+        st.markdown(f"**Estado actual:** {estado_actual}")
+
+        with st.form("form_cambiar_estado"):
+            nuevo_estado_sel = st.selectbox("Nuevo estado", ESTADOS_VALIDOS)
+            motivo_estado = st.text_area("Motivo del cambio de estado (obligatorio)")
+            if st.form_submit_button("Actualizar Estado"):
+                if not motivo_estado.strip():
+                    st.error("Debe indicar un motivo.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("UPDATE requisitions SET situacao_solici = %s WHERE req_code = %s", (nuevo_estado_sel, ctrl_req_code))
+                            cursor.execute("""
+                                INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                VALUES (%s, %s, %s, %s, %s)
+                            """, (ctrl_req_code, 'situacao_solici', str(estado_actual), nuevo_estado_sel, motivo_estado))
+                            registrar_notificacion(cursor, ctrl_req_code, 'cambio_estado',
+                                                    f"La requisición {ctrl_req_code} cambió a estado '{nuevo_estado_sel}'.")
+                    st.success("Estado actualizado y notificación registrada.")
+                    st.rerun()
+
+    # --- Req. 3: consolidar varias solicitudes / dividir una solicitud ---
+    with tab_consolida:
+        st.markdown("**Consolidar varias solicitudes en una sola Orden de Compra**")
+        todas_reqs = pd.read_sql_query("SELECT req_code FROM requisitions ORDER BY req_code", get_engine())
+        with st.form("form_consolidar"):
+            reqs_a_consolidar = st.multiselect("Seleccione las requisiciones a consolidar", todas_reqs['req_code'].tolist())
+            numero_oc_consolidada = st.text_input("Número de Orden de Compra consolidada")
+            motivo_consol = st.text_area("Motivo / observación (obligatorio)")
+            if st.form_submit_button("🔗 Consolidar en una OC"):
+                if not reqs_a_consolidar or not numero_oc_consolidada.strip() or not motivo_consol.strip():
+                    st.error("Complete todos los campos.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            for req in reqs_a_consolidar:
+                                cursor.execute("UPDATE requisitions SET pedido = %s, situacao_solici = 'Orden de Compra emitida' WHERE req_code = %s", (numero_oc_consolidada, req))
+                                cursor.execute("""
+                                    INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (req, 'consolidacion_oc', '-', numero_oc_consolidada, motivo_consol))
+                                registrar_notificacion(cursor, req, 'oc_emitida', f"Orden de Compra consolidada {numero_oc_consolidada} emitida.")
+                    st.success(f"{len(reqs_a_consolidar)} requisiciones consolidadas en la OC {numero_oc_consolidada}.")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("**Dividir una solicitud en varias Órdenes de Compra**")
+        df_det_dividir = pd.read_sql_query(
+            "SELECT id, item_codigo FROM requisitions_detalles WHERE requisicion_id = %(req)s",
+            get_engine(), params={"req": ctrl_req_code}
+        )
+        with st.form("form_dividir"):
+            ids_grupo_2 = st.multiselect(
+                "Ítems (ID) que van a la NUEVA OC (el resto queda en la OC original)",
+                df_det_dividir['id'].tolist() if not df_det_dividir.empty else []
+            )
+            nuevo_req_code_split = st.text_input("Código de la nueva requisición/OC derivada")
+            motivo_div = st.text_area("Motivo de la división (obligatorio)", key="motivo_div")
+            if st.form_submit_button("✂️ Dividir en Nueva OC"):
+                if not ids_grupo_2 or not nuevo_req_code_split.strip() or not motivo_div.strip():
+                    st.error("Complete todos los campos.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO requisitions (req_code, situacao_solici, pedido, area_name)
+                                SELECT %s, situacao_solici, pedido, area_name FROM requisitions WHERE req_code = %s
+                                ON CONFLICT (req_code) DO NOTHING
+                            """, (nuevo_req_code_split, ctrl_req_code))
+                            cursor.execute("UPDATE requisitions_detalles SET requisicion_id = %s WHERE id = ANY(%s)", (nuevo_req_code_split, ids_grupo_2))
+                            cursor.execute("""
+                                INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                VALUES (%s, %s, %s, %s, %s)
+                            """, (ctrl_req_code, 'division_oc', ctrl_req_code, nuevo_req_code_split, motivo_div))
+                    st.success(f"Ítems movidos a la nueva requisición/OC {nuevo_req_code_split}.")
+                    st.rerun()
+
+    # --- Req. 9: Gestión documental (MVP: BYTEA en Postgres, no Supabase Storage) ---
+    with tab_docs:
+        st.caption("MVP: los documentos se guardan como metadata + contenido (BYTEA) directamente en la base de datos. "
+                   "Si se prefiere Supabase Storage más adelante, se puede migrar sin cambiar esta interfaz.")
+        tipo_doc = st.selectbox("Tipo de documento", ["Cotización", "Factura Proforma", "Especificación Técnica", "Contrato", "Foto", "Correo", "Otro"])
+        archivo_subido = st.file_uploader("Adjuntar archivo", key="doc_upload")
+        if archivo_subido and st.button("📎 Guardar Documento"):
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO documentos_adjuntos (requisicion_id, nombre_archivo, tipo_documento, contenido, subido_por)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (ctrl_req_code, archivo_subido.name, tipo_doc, archivo_subido.read(), st.session_state.user_email))
+            st.success("Documento adjuntado correctamente.")
+            st.rerun()
+
+        df_docs = pd.read_sql_query(
+            "SELECT nombre_archivo, tipo_documento, subido_por, fecha_subida FROM documentos_adjuntos WHERE requisicion_id = %(req)s ORDER BY fecha_subida DESC",
+            get_engine(), params={"req": ctrl_req_code}
+        )
+        if not df_docs.empty:
+            st.dataframe(df_docs, use_container_width=True)
+        else:
+            st.info("No hay documentos adjuntos para esta requisición.")
+
+    # --- Recomendado: fechas comprometidas + recepción parcial/completa ---
+    with tab_recepcion:
+        df_fecha = pd.read_sql_query("SELECT fecha_comprometida FROM requisitions WHERE req_code = %(req)s", get_engine(), params={"req": ctrl_req_code})
+        fecha_actual = df_fecha.iloc[0]['fecha_comprometida'] if not df_fecha.empty else None
+        st.markdown(f"**Fecha comprometida actual:** {fecha_actual if fecha_actual else 'No definida'}")
+        with st.form("form_fecha_compr"):
+            nueva_fecha = st.date_input("Nueva fecha comprometida de entrega")
+            if st.form_submit_button("Guardar Fecha Comprometida"):
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("UPDATE requisitions SET fecha_comprometida = %s WHERE req_code = %s", (nueva_fecha, ctrl_req_code))
+                st.success("Fecha comprometida guardada.")
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("**Recepción de Ítems (parcial / completa)**")
+        df_det_recep = pd.read_sql_query(
+            "SELECT id, item_codigo, cantidad_comprador, cantidad_recibida, estado_recepcion FROM requisitions_detalles WHERE requisicion_id = %(req)s",
+            get_engine(), params={"req": ctrl_req_code}
+        )
+        if not df_det_recep.empty:
+            st.dataframe(df_det_recep, use_container_width=True)
+            with st.form("form_recepcion"):
+                id_recep = st.selectbox("Línea a recepcionar (ID)", df_det_recep['id'].tolist())
+                cantidad_recibida_input = st.number_input("Cantidad recibida (acumulada)", min_value=0, value=0)
+                if st.form_submit_button("📥 Registrar Recepción"):
+                    fila = df_det_recep[df_det_recep['id'] == id_recep].iloc[0]
+                    cant_comprada = fila['cantidad_comprador'] or 0
+                    if cantidad_recibida_input <= 0:
+                        estado_recep_nuevo = 'Pendiente'
+                    elif cantidad_recibida_input < cant_comprada:
+                        estado_recep_nuevo = 'Recepción parcial'
+                    else:
+                        estado_recep_nuevo = 'Recepción completa'
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                UPDATE requisitions_detalles SET cantidad_recibida = %s, estado_recepcion = %s WHERE id = %s
+                            """, (cantidad_recibida_input, estado_recep_nuevo, id_recep))
+                            cursor.execute("""
+                                INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                VALUES (%s, %s, %s, %s, %s)
+                            """, (ctrl_req_code, 'recepcion_item', str(fila['cantidad_recibida']), str(cantidad_recibida_input),
+                                  f"Actualización de recepción a {estado_recep_nuevo}"))
+                    st.success(f"Recepción registrada: {estado_recep_nuevo}")
+                    st.rerun()
+        else:
+            st.info("No hay ítems para recepcionar.")
+
+# 9. BUSCADOR RÁPIDO (NUEVO — Requerimiento 6, recomendado)
+elif opcion_menu == "🔍 Buscador Rápido":
+    st.subheader("Buscador Rápido")
+    termino = st.text_input("Buscar por número de solicitud, proveedor o producto")
+    if termino:
+        df_busq_reqs = pd.read_sql_query(
+            "SELECT req_code, situacao_solici, area_name FROM requisitions WHERE req_code ILIKE %(t)s",
+            get_engine(), params={"t": f"%{termino}%"}
+        )
+        df_busq_prov = pd.read_sql_query(
+            "SELECT ruc, name FROM providers WHERE name ILIKE %(t)s OR ruc ILIKE %(t)s",
+            get_engine(), params={"t": f"%{termino}%"}
+        )
+        df_busq_item = pd.read_sql_query(
+            "SELECT codigo, descripcion_estandar FROM items WHERE descripcion_estandar ILIKE %(t)s OR codigo ILIKE %(t)s",
+            get_engine(), params={"t": f"%{termino}%"}
+        )
+        st.markdown("**Solicitudes**")
+        st.dataframe(df_busq_reqs, use_container_width=True) if not df_busq_reqs.empty else st.caption("Sin resultados.")
+        st.markdown("**Proveedores**")
+        st.dataframe(df_busq_prov, use_container_width=True) if not df_busq_prov.empty else st.caption("Sin resultados.")
+        st.markdown("**Productos**")
+        st.dataframe(df_busq_item, use_container_width=True) if not df_busq_item.empty else st.caption("Sin resultados.")
+    else:
+        st.caption("Ingrese un término de búsqueda para comenzar.")
+
+# 10. NOTIFICACIONES (NUEVO — Requerimiento 10, bitácora)
+elif opcion_menu == "🔔 Notificaciones":
+    st.subheader("Bitácora de Notificaciones Pendientes / Generadas")
+    st.caption("MVP: log de eventos en base de datos. No hay envío de email real configurado todavía.")
+    df_notifs = pd.read_sql_query(
+        "SELECT requisicion_id, tipo_evento, mensaje, fecha_generada, leida FROM notificaciones_pendientes ORDER BY fecha_generada DESC LIMIT 200",
+        get_engine()
+    )
+    if not df_notifs.empty:
+        st.dataframe(df_notifs, use_container_width=True)
+    else:
+        st.info("No hay notificaciones registradas.")
