@@ -334,6 +334,22 @@ def upsert_detalle_linea(cursor, req_code_val, item_cod, narrativa, cantidad):
             VALUES (%s, %s, %s, %s, %s)
         """, (req_code_val, item_cod, narrativa, cantidad, cantidad))
 
+# --- NUEVO: Control de presupuesto disponible por área (bloqueante) ---
+# MVP: se suma el saldo disponible (monto_asignado - monto_utilizado) de TODAS las
+# filas de presupuestos_area que coincidan con el área, sin distinguir por empresa
+# compradora ni período. Es una simplificación deliberada: al crear la solicitud
+# todavía no existe cotización ni empresa compradora asignada, así que solo se
+# puede validar "¿el área tiene saldo mayor a cero en algún presupuesto cargado?".
+# El chequeo fino por monto real se hace después, en el Cuadro Comparativo.
+def obtener_saldo_disponible(area_name):
+    if not area_name:
+        return 0.0
+    df_saldo = pd.read_sql_query(
+        "SELECT COALESCE(SUM(monto_asignado - monto_utilizado), 0) AS disponible FROM presupuestos_area WHERE area_name = %(a)s",
+        get_engine(), params={"a": area_name}
+    )
+    return float(df_saldo.iloc[0]['disponible']) if not df_saldo.empty else 0.0
+
 
 # =====================================================================
 # SISTEMA DE AUTENTICACIÓN IMPLACABLE
@@ -937,52 +953,68 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
         if up_quotes:
             df_q = pd.read_excel(up_quotes)
             if st.button("🚀 Consolidar Cuadro Comparativo y Disparar Flujo Jerárquico"):
-                with get_db_connection() as conn:
-                    with conn.cursor() as cursor:
-                        for _, r in df_q.iterrows():
-                            cursor.execute("""
-                                INSERT INTO budgets (req_code, provider_ruc, price, payment_terms_days, delivery_time_days)
-                                VALUES (%s, %s, %s, %s, %s)
-                            """, (c_req_code, clean_id(r['proveedor_ruc']), float(r['precio_total_usd']), safe_int(r['plazo_pago_dias']), safe_int(r['tiempo_entrega_dias'])))
+                # --- NUEVO: Control de presupuesto disponible (bloqueante, chequeo fino) ---
+                # Acá sí conocemos el monto real: se usa la cotización MÁS BAJA subida
+                # como estimación conservadora del compromiso (Compras podrá refinar
+                # la elección de proveedor después en "Control de Compras").
+                cursor_area_check = pd.read_sql_query(
+                    "SELECT area_name FROM requisitions WHERE req_code = %(req)s", get_engine(), params={"req": c_req_code}
+                )
+                area_de_la_req = cursor_area_check.iloc[0]['area_name'] if not cursor_area_check.empty else None
+                monto_estimado = float(df_q['precio_total_usd'].min()) if 'precio_total_usd' in df_q.columns and not df_q.empty else 0.0
+                saldo_area_req = obtener_saldo_disponible(area_de_la_req)
 
-                        # --- FIX: el flujo quedaba huérfano porque nunca se asignaba
-                        # aprobador_actual. Se busca al primer aprobador de la cadena
-                        # (secuencia_orden = 1) y se lo asigna explícitamente; sin esto,
-                        # la bandeja de "Aprobar / Rechazar" nunca mostraba la requisición
-                        # a nadie, porque esa pantalla filtra por aprobador_actual = email.
-                        cursor.execute("""
-                            SELECT email FROM usuarios
-                            WHERE rol = 'aprobador' AND secuencia_orden = 1
-                            ORDER BY secuencia_orden ASC LIMIT 1
-                        """)
-                        primer_aprobador = cursor.fetchone()
-
-                        if primer_aprobador:
-                            cursor.execute("""
-                                UPDATE requisitions SET
-                                situacao_solici = 'Pendiente Aprobación',
-                                secuencia_aprobacion_actual = 1,
-                                aprobador_actual = %s
-                                WHERE req_code = %s
-                            """, (primer_aprobador[0], c_req_code))
-                        else:
-                            cursor.execute("""
-                                UPDATE requisitions SET
-                                situacao_solici = 'Pendiente Aprobación',
-                                secuencia_aprobacion_actual = 1
-                                WHERE req_code = %s
-                            """, (c_req_code,))
-
-                        # NUEVO (Requerimiento 10): notificación mínima de evento
-                        registrar_notificacion(cursor, c_req_code, 'pendiente_aprobacion',
-                                                f"La requisición {c_req_code} quedó pendiente de aprobación tras cargar cotizaciones.")
-
-                if primer_aprobador:
-                    st.success(f"Ofertas indexadas. La requisición avanzó a la ruta crítica de {primer_aprobador[0]}.")
+                if monto_estimado > saldo_area_req:
+                    st.error(f"⚠️ Bloqueado por presupuesto: el área '{area_de_la_req}' tiene disponible "
+                             f"USD {saldo_area_req:,.2f}, pero la cotización más baja es de USD {monto_estimado:,.2f}. "
+                             "No se puede disparar el flujo de aprobación hasta ajustar el presupuesto o la cotización.")
                 else:
-                    st.warning("Ofertas indexadas, pero no hay ningún usuario con rol 'aprobador' y secuencia_orden = 1 "
-                               "cargado en la tabla 'usuarios'. La requisición quedó en 'Pendiente Aprobación' pero "
-                               "sin aprobador asignado — cárguelo en Mapeador Masivo → Carga de Usuarios.")
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            for _, r in df_q.iterrows():
+                                cursor.execute("""
+                                    INSERT INTO budgets (req_code, provider_ruc, price, payment_terms_days, delivery_time_days)
+                                    VALUES (%s, %s, %s, %s, %s)
+                                """, (c_req_code, clean_id(r['proveedor_ruc']), float(r['precio_total_usd']), safe_int(r['plazo_pago_dias']), safe_int(r['tiempo_entrega_dias'])))
+
+                            # --- FIX: el flujo quedaba huérfano porque nunca se asignaba
+                            # aprobador_actual. Se busca al primer aprobador de la cadena
+                            # (secuencia_orden = 1) y se lo asigna explícitamente; sin esto,
+                            # la bandeja de "Aprobar / Rechazar" nunca mostraba la requisición
+                            # a nadie, porque esa pantalla filtra por aprobador_actual = email.
+                            cursor.execute("""
+                                SELECT email FROM usuarios
+                                WHERE rol = 'aprobador' AND secuencia_orden = 1
+                                ORDER BY secuencia_orden ASC LIMIT 1
+                            """)
+                            primer_aprobador = cursor.fetchone()
+
+                            if primer_aprobador:
+                                cursor.execute("""
+                                    UPDATE requisitions SET
+                                    situacao_solici = 'Pendiente Aprobación',
+                                    secuencia_aprobacion_actual = 1,
+                                    aprobador_actual = %s
+                                    WHERE req_code = %s
+                                """, (primer_aprobador[0], c_req_code))
+                            else:
+                                cursor.execute("""
+                                    UPDATE requisitions SET
+                                    situacao_solici = 'Pendiente Aprobación',
+                                    secuencia_aprobacion_actual = 1
+                                    WHERE req_code = %s
+                                """, (c_req_code,))
+
+                            # NUEVO (Requerimiento 10): notificación mínima de evento
+                            registrar_notificacion(cursor, c_req_code, 'pendiente_aprobacion',
+                                                    f"La requisición {c_req_code} quedó pendiente de aprobación tras cargar cotizaciones.")
+
+                    if primer_aprobador:
+                        st.success(f"Ofertas indexadas. La requisición avanzó a la ruta crítica de {primer_aprobador[0]}.")
+                    else:
+                        st.warning("Ofertas indexadas, pero no hay ningún usuario con rol 'aprobador' y secuencia_orden = 1 "
+                                   "cargado en la tabla 'usuarios'. La requisición quedó en 'Pendiente Aprobación' pero "
+                                   "sin aprobador asignado — cárguelo en Mapeador Masivo → Carga de Usuarios.")
 
     st.markdown("---")
     st.subheader(f"Matriz de Comparación Operativa para Requisición: {c_req_code}")
@@ -1171,6 +1203,47 @@ elif opcion_menu == "✅ Aprobar / Rechazar":
                             """, (req_a_resolver,))
                             nuevo_estado = 'Aprobada'
 
+                            # --- NUEVO: débito automático de presupuesto al aprobar en firme ---
+                            # Se usa el precio de la cotización marcada como seleccionada
+                            # (budgets.seleccionado = TRUE, definida en "Control de Compras");
+                            # si Compras todavía no seleccionó ninguna, se usa la más baja
+                            # cargada como respaldo (misma estimación conservadora del
+                            # chequeo hecho al disparar el flujo).
+                            cursor.execute("""
+                                SELECT price FROM budgets WHERE req_code = %s AND seleccionado = TRUE LIMIT 1
+                            """, (req_a_resolver,))
+                            precio_sel = cursor.fetchone()
+                            if not precio_sel:
+                                cursor.execute("SELECT MIN(price) FROM budgets WHERE req_code = %s", (req_a_resolver,))
+                                precio_sel = cursor.fetchone()
+
+                            monto_a_debitar = precio_sel[0] if precio_sel and precio_sel[0] is not None else None
+
+                            if monto_a_debitar:
+                                cursor.execute("SELECT area_name FROM requisitions WHERE req_code = %s", (req_a_resolver,))
+                                area_req_row = cursor.fetchone()
+                                area_req_val = area_req_row[0] if area_req_row else None
+
+                                if area_req_val:
+                                    # MVP: se debita de UNA sola fila de presupuestos_area (la de
+                                    # mayor saldo disponible para esa área), sin prorratear entre
+                                    # varios períodos/empresas si hubiera más de una fila cargada.
+                                    cursor.execute("""
+                                        SELECT id FROM presupuestos_area
+                                        WHERE area_name = %s
+                                        ORDER BY (monto_asignado - monto_utilizado) DESC LIMIT 1
+                                    """, (area_req_val,))
+                                    fila_presu = cursor.fetchone()
+                                    if fila_presu:
+                                        cursor.execute("""
+                                            UPDATE presupuestos_area SET monto_utilizado = monto_utilizado + %s WHERE id = %s
+                                        """, (monto_a_debitar, fila_presu[0]))
+                                        cursor.execute("""
+                                            INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
+                                            VALUES (%s, %s, %s, %s, %s)
+                                        """, (req_a_resolver, 'presupuesto_debitado', '-', f"USD {monto_a_debitar:,.2f}",
+                                              f"Débito automático de presupuesto del área '{area_req_val}' al aprobar en firme."))
+
                         cursor.execute("""
                             INSERT INTO trazabilidad_cambios (requisicion_id, campo_modificado, valor_anterior, valor_nuevo, justificacion)
                             VALUES (%s, %s, %s, %s, %s)
@@ -1208,15 +1281,43 @@ elif opcion_menu == "📝 Nueva Solicitud":
     st.caption("Una vez enviada, la solicitud queda bloqueada para el Solicitante: cualquier cambio "
                "(cantidades, ítems, cancelación) debe canalizarse a través de Compras (ver 'Control de Compras').")
 
+    # --- NUEVO: Control de presupuesto disponible (bloqueante en el punto de creación) ---
+    # El selector de área va FUERA del st.form para que el saldo se recalcule al
+    # instante al cambiar de área (dentro de un form, Streamlit no re-renderiza
+    # hasta el submit).
+    df_areas_presu = pd.read_sql_query("SELECT DISTINCT area_name FROM presupuestos_area", get_engine())
+    df_areas_emails = pd.read_sql_query("SELECT DISTINCT area_name FROM areas_emails", get_engine())
+    areas_disponibles = sorted(set(df_areas_presu['area_name'].dropna().tolist()) | set(df_areas_emails['area_name'].dropna().tolist()))
+
+    if not areas_disponibles:
+        st.warning("No hay áreas cargadas todavía (ni en 'Presupuestos' ni en 'Áreas y Emails'). "
+                   "Pídale a Administración que cargue al menos una antes de solicitar.")
+        area_sol = None
+        saldo_area = 0.0
+    else:
+        area_sol = st.selectbox("Área / Centro de Costo", areas_disponibles, key="area_sol_select")
+        saldo_area = obtener_saldo_disponible(area_sol)
+        # NOTA MVP: acá solo se valida "¿el área tiene saldo > 0?", porque todavía
+        # no existe cotización ni monto exacto del pedido (eso se sabe recién en
+        # el Cuadro Comparativo, donde se hace el chequeo fino por monto real).
+        if saldo_area > 0:
+            st.success(f"💰 Saldo disponible para '{area_sol}': USD {saldo_area:,.2f}")
+        else:
+            st.error(f"⚠️ El área '{area_sol}' no tiene saldo disponible (USD {saldo_area:,.2f}). "
+                     "No podrá enviar la solicitud hasta que Administración cargue presupuesto para esta área.")
+
     with st.form("form_nueva_solicitud"):
-        area_sol = st.text_input("Área / Centro de Costo")
         items_disponibles = pd.read_sql_query("SELECT codigo, descripcion_estandar FROM items", get_engine())
         item_sol = st.selectbox("Ítem", items_disponibles['codigo'].tolist() if not items_disponibles.empty else [])
         cantidad_sol = st.number_input("Cantidad solicitada", min_value=1, value=1)
         narrativa_sol = st.text_area("Descripción / narrativa de la necesidad")
 
         if st.form_submit_button("📨 Enviar Solicitud"):
-            if not item_sol:
+            if not area_sol:
+                st.error("⚠️ Bloqueado: no hay ningún área disponible para asociar la solicitud.")
+            elif saldo_area <= 0:
+                st.error("⚠️ Bloqueado: el área seleccionada no tiene saldo presupuestario disponible.")
+            elif not item_sol:
                 st.error("No hay ítems cargados en el catálogo todavía.")
             else:
                 with get_db_connection() as conn:
@@ -1234,7 +1335,7 @@ elif opcion_menu == "📝 Nueva Solicitud":
                             INSERT INTO requisitions (req_code, situacao_solici, pedido, data_solicita, analista_email, area_name)
                             VALUES (%s, %s, %s, %s, %s, %s)
                         """, (nuevo_req_code, 'Borrador', '0', datetime.now().date(),
-                              st.session_state.user_email, area_sol or "Pendiente de Clasificación"))
+                              st.session_state.user_email, area_sol))
 
                         cursor.execute("""
                             INSERT INTO requisitions_detalles (requisicion_id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador)
