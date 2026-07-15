@@ -762,16 +762,44 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
                                 VALUES (%s, %s, %s, %s, %s)
                             """, (c_req_code, clean_id(r['proveedor_ruc']), float(r['precio_total_usd']), safe_int(r['plazo_pago_dias']), safe_int(r['tiempo_entrega_dias'])))
 
+                        # --- FIX: el flujo quedaba huérfano porque nunca se asignaba
+                        # aprobador_actual. Se busca al primer aprobador de la cadena
+                        # (secuencia_orden = 1) y se lo asigna explícitamente; sin esto,
+                        # la bandeja de "Aprobar / Rechazar" nunca mostraba la requisición
+                        # a nadie, porque esa pantalla filtra por aprobador_actual = email.
                         cursor.execute("""
-                            UPDATE requisitions SET
-                            situacao_solici = 'Pendiente Aprobación',
-                            secuencia_aprobacion_actual = 1
-                            WHERE req_code = %s
-                        """, (c_req_code,))
+                            SELECT email FROM usuarios
+                            WHERE rol = 'aprobador' AND secuencia_orden = 1
+                            ORDER BY secuencia_orden ASC LIMIT 1
+                        """)
+                        primer_aprobador = cursor.fetchone()
+
+                        if primer_aprobador:
+                            cursor.execute("""
+                                UPDATE requisitions SET
+                                situacao_solici = 'Pendiente Aprobación',
+                                secuencia_aprobacion_actual = 1,
+                                aprobador_actual = %s
+                                WHERE req_code = %s
+                            """, (primer_aprobador[0], c_req_code))
+                        else:
+                            cursor.execute("""
+                                UPDATE requisitions SET
+                                situacao_solici = 'Pendiente Aprobación',
+                                secuencia_aprobacion_actual = 1
+                                WHERE req_code = %s
+                            """, (c_req_code,))
+
                         # NUEVO (Requerimiento 10): notificación mínima de evento
                         registrar_notificacion(cursor, c_req_code, 'pendiente_aprobacion',
                                                 f"La requisición {c_req_code} quedó pendiente de aprobación tras cargar cotizaciones.")
-                st.success("Ofertas indexadas. La requisición avanzó a la ruta crítica del 'Aprobador 1'.")
+
+                if primer_aprobador:
+                    st.success(f"Ofertas indexadas. La requisición avanzó a la ruta crítica de {primer_aprobador[0]}.")
+                else:
+                    st.warning("Ofertas indexadas, pero no hay ningún usuario con rol 'aprobador' y secuencia_orden = 1 "
+                               "cargado en la tabla 'usuarios'. La requisición quedó en 'Pendiente Aprobación' pero "
+                               "sin aprobador asignado — cárguelo en Mapeador Masivo → Carga de Usuarios.")
 
     st.markdown("---")
     st.subheader(f"Matriz de Comparación Operativa para Requisición: {c_req_code}")
