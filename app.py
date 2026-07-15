@@ -302,6 +302,38 @@ def registrar_notificacion(cursor, req_code, tipo_evento, mensaje):
         VALUES (%s, %s, %s)
     """, (req_code, tipo_evento, mensaje))
 
+# --- NUEVO: helper reusado por la carga masiva Y por el alta individual de la
+# Planilla Maestro de Requisiciones. Aplica el mismo criterio del FIX Bug #3:
+# si la línea ya existe y cantidad_comprador ya fue auditada por Compras
+# (difiere de cantidad_solicitada), se preserva; si nunca fue tocada, se sincroniza.
+def upsert_detalle_linea(cursor, req_code_val, item_cod, narrativa, cantidad):
+    cursor.execute("""
+        SELECT id, cantidad_solicitada, cantidad_comprador
+        FROM requisitions_detalles
+        WHERE requisicion_id = %s AND item_codigo = %s
+    """, (req_code_val, item_cod))
+    existing = cursor.fetchone()
+
+    if existing:
+        existing_id, existing_cant_sol, existing_cant_comp = existing
+        if existing_cant_comp == existing_cant_sol:
+            cursor.execute("""
+                UPDATE requisitions_detalles
+                SET cantidad_solicitada = %s, narrativa_solicitante = %s, cantidad_comprador = %s
+                WHERE id = %s
+            """, (cantidad, narrativa, cantidad, existing_id))
+        else:
+            cursor.execute("""
+                UPDATE requisitions_detalles
+                SET cantidad_solicitada = %s, narrativa_solicitante = %s
+                WHERE id = %s
+            """, (cantidad, narrativa, existing_id))
+    else:
+        cursor.execute("""
+            INSERT INTO requisitions_detalles (requisicion_id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (req_code_val, item_cod, narrativa, cantidad, cantidad))
+
 
 # =====================================================================
 # SISTEMA DE AUTENTICACIÓN IMPLACABLE
@@ -529,6 +561,8 @@ elif opcion_menu == "🤝 Gestión de Proveedores":
 # 3. MAPEADOR MASIVO
 elif opcion_menu == "📥 Mapeador Masivo":
     st.subheader("Carga, Validación e Inicialización Masiva de Registros mediante Excel")
+    st.caption("Cada pestaña permite cargar un registro individual directamente en pantalla, "
+               "o subir un Excel con muchos registros a la vez.")
 
     # --- FIX Bug #2 + NUEVO (Requerimiento 4 y recomendado de presupuesto) ---
     t_usuarios, t_items, t_prov, t_areas, t_empresas, t_presu, t_reqs = st.tabs([
@@ -538,8 +572,32 @@ elif opcion_menu == "📥 Mapeador Masivo":
     ])
 
     with t_usuarios:
+        st.markdown("#### ➕ Cargar un usuario")
+        with st.form("form_individual_usuario"):
+            fu_nombre = st.text_input("Nombre")
+            fu_email = st.text_input("Email")
+            fu_rol = st.selectbox("Rol", ["solicitante", "jefe de área", "comprador", "gerencia", "directorio", "auditoría", "administración", "aprobador"])
+            fu_nivel = st.text_input("Nivel de aprobación (opcional, solo aplica a rol 'aprobador')")
+            fu_secuencia = st.number_input("Secuencia de orden (opcional, solo aplica a rol 'aprobador')", min_value=0, value=0)
+            if st.form_submit_button("Guardar Usuario"):
+                if not fu_nombre.strip() or not fu_email.strip():
+                    st.error("Nombre y email son obligatorios.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO usuarios (nombre, email, rol, nivel_aprobacion, secuencia_orden)
+                                VALUES (%s, %s, %s, %s, %s) ON CONFLICT (email) DO UPDATE SET
+                                nombre=EXCLUDED.nombre, rol=EXCLUDED.rol, nivel_aprobacion=EXCLUDED.nivel_aprobacion, secuencia_orden=EXCLUDED.secuencia_orden
+                            """, (fu_nombre.strip(), fu_email.strip(), fu_rol, fu_nivel.strip(), safe_int(fu_secuencia)))
+                    st.success(f"Usuario {fu_email} guardado.")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 📊 Carga masiva por Excel")
         cols_u = ['nombre', 'email', 'rol', 'nivel_aprobacion', 'secuencia_orden']
-        st.download_button("📥 Descargar Plantilla Ejemplo (Usuarios)", generar_excel_descarga(cols_u), "ejemplo_usuarios.xlsx", "application/vnd.ms-excel")
+        ejemplo_u = [['Celeste Benítez', 'celeste.benitez@ejemplo.com', 'solicitante', '', 0]]
+        st.download_button("📥 Descargar Plantilla Ejemplo (Usuarios)", generar_excel_descarga(cols_u, ejemplo_u), "ejemplo_usuarios.xlsx", "application/vnd.ms-excel")
         up_u = st.file_uploader("Subir planilla de usuarios", type=["xlsx", "csv"], key="u_up")
         if up_u:
             df = pd.read_excel(up_u) if up_u.name.endswith('xlsx') else pd.read_csv(up_u)
@@ -555,8 +613,30 @@ elif opcion_menu == "📥 Mapeador Masivo":
                 st.success("Usuarios sincronizados masivamente.")
 
     with t_items:
+        st.markdown("#### ➕ Cargar un ítem")
+        with st.form("form_individual_item"):
+            fi_codigo = st.text_input("Código")
+            fi_desc = st.text_input("Descripción estándar")
+            fi_unidad = st.text_input("Unidad de medida")
+            if st.form_submit_button("Guardar Ítem"):
+                if not fi_codigo.strip():
+                    st.error("El código es obligatorio.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO items (codigo, descripcion_estandar, unidad_medida)
+                                VALUES (%s, %s, %s) ON CONFLICT (codigo) DO UPDATE SET
+                                descripcion_estandar=EXCLUDED.descripcion_estandar, unidad_medida=EXCLUDED.unidad_medida
+                            """, (clean_id(fi_codigo), fi_desc.strip(), fi_unidad.strip()))
+                    st.success(f"Ítem {fi_codigo} guardado.")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 📊 Carga masiva por Excel")
         cols_i = ['codigo', 'descripcion_estandar', 'unidad_medida']
-        st.download_button("📥 Descargar Plantilla Ejemplo (Ítems)", generar_excel_descarga(cols_i), "ejemplo_items.xlsx", "application/vnd.ms-excel")
+        ejemplo_i = [['IT-0001', 'Guantes de nitrilo talla M', 'Caja x100']]
+        st.download_button("📥 Descargar Plantilla Ejemplo (Ítems)", generar_excel_descarga(cols_i, ejemplo_i), "ejemplo_items.xlsx", "application/vnd.ms-excel")
         up_i = st.file_uploader("Subir planilla del catálogo", type=["xlsx", "csv"], key="i_up")
         if up_i:
             df = pd.read_excel(up_i) if up_i.name.endswith('xlsx') else pd.read_csv(up_i)
@@ -572,8 +652,31 @@ elif opcion_menu == "📥 Mapeador Masivo":
                 st.success("Catálogo maestro actualizado sin duplicados.")
 
     with t_prov:
+        st.markdown("#### ➕ Cargar un proveedor")
+        with st.form("form_individual_proveedor"):
+            fp_ruc = st.text_input("RUC")
+            fp_name = st.text_input("Razón Social")
+            fp_email = st.text_input("Email Comercial")
+            fp_phone = st.text_input("Teléfono de Contacto")
+            if st.form_submit_button("Guardar Proveedor"):
+                if not fp_ruc.strip() or not fp_name.strip():
+                    st.error("RUC y Razón Social son obligatorios.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO providers (ruc, name, email, contact_phone)
+                                VALUES (%s, %s, %s, %s) ON CONFLICT (ruc) DO UPDATE SET
+                                name=EXCLUDED.name, email=EXCLUDED.email, contact_phone=EXCLUDED.contact_phone
+                            """, (clean_id(fp_ruc), fp_name.strip(), fp_email.strip(), clean_id(fp_phone)))
+                    st.success(f"Proveedor {fp_name} guardado.")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 📊 Carga masiva por Excel")
         cols_p = ['ruc', 'name', 'email', 'contact_phone']
-        st.download_button("📥 Descargar Plantilla Ejemplo (Proveedores)", generar_excel_descarga(cols_p), "ejemplo_proveedores.xlsx", "application/vnd.ms-excel")
+        ejemplo_p = [['80012345-6', 'Distribuidora Ejemplo SA', 'ventas@distribuidoraejemplo.com', '0981123456']]
+        st.download_button("📥 Descargar Plantilla Ejemplo (Proveedores)", generar_excel_descarga(cols_p, ejemplo_p), "ejemplo_proveedores.xlsx", "application/vnd.ms-excel")
         up_p = st.file_uploader("Subir planilla de proveedores", type=["xlsx", "csv"], key="p_up")
         if up_p:
             df = pd.read_excel(up_p) if up_p.name.endswith('xlsx') else pd.read_csv(up_p)
@@ -590,8 +693,29 @@ elif opcion_menu == "📥 Mapeador Masivo":
 
     # --- NUEVO Bug #2: carga masiva de areas_emails (mismo patrón que t_prov) ---
     with t_areas:
+        st.markdown("#### ➕ Cargar un área")
+        with st.form("form_individual_area"):
+            fa_area = st.text_input("Nombre del Área")
+            fa_email = st.text_input("Email asociado")
+            if st.form_submit_button("Guardar Área"):
+                if not fa_area.strip() or not fa_email.strip():
+                    st.error("Ambos campos son obligatorios.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO areas_emails (area_name, email)
+                                VALUES (%s, %s) ON CONFLICT (email) DO UPDATE SET
+                                area_name=EXCLUDED.area_name
+                            """, (fa_area.strip(), fa_email.strip()))
+                    st.success(f"Área {fa_area} guardada.")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 📊 Carga masiva por Excel")
         cols_a = ['area_name', 'email']
-        st.download_button("📥 Descargar Plantilla Ejemplo (Áreas y Emails)", generar_excel_descarga(cols_a), "ejemplo_areas_emails.xlsx", "application/vnd.ms-excel")
+        ejemplo_a = [['Mantenimiento', 'mantenimiento@ejemplo.com']]
+        st.download_button("📥 Descargar Plantilla Ejemplo (Áreas y Emails)", generar_excel_descarga(cols_a, ejemplo_a), "ejemplo_areas_emails.xlsx", "application/vnd.ms-excel")
         up_a = st.file_uploader("Subir planilla de áreas y emails", type=["xlsx", "csv"], key="a_up")
         if up_a:
             df = pd.read_excel(up_a) if up_a.name.endswith('xlsx') else pd.read_csv(up_a)
@@ -606,10 +730,31 @@ elif opcion_menu == "📥 Mapeador Masivo":
                             """, (str(r['area_name']).strip(), str(r['email']).strip()))
                 st.success("Mapeo de áreas y emails actualizado sin duplicados.")
 
-    # --- NUEVO (Requerimiento 4): carga masiva de Empresas Compradoras (16 RUC) ---
+    # --- NUEVO (Requerimiento 4): Empresas Compradoras (16 RUC) ---
     with t_empresas:
+        st.markdown("#### ➕ Cargar una empresa compradora")
+        with st.form("form_individual_empresa"):
+            fe_ruc = st.text_input("RUC")
+            fe_razon = st.text_input("Razón Social")
+            if st.form_submit_button("Guardar Empresa Compradora"):
+                if not fe_ruc.strip() or not fe_razon.strip():
+                    st.error("Ambos campos son obligatorios.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO empresas_compradoras (ruc, razon_social)
+                                VALUES (%s, %s) ON CONFLICT (ruc) DO UPDATE SET
+                                razon_social=EXCLUDED.razon_social
+                            """, (clean_id(fe_ruc), fe_razon.strip()))
+                    st.success(f"Empresa {fe_razon} guardada.")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 📊 Carga masiva por Excel")
         cols_emp = ['ruc', 'razon_social']
-        st.download_button("📥 Descargar Plantilla Ejemplo (Empresas Compradoras)", generar_excel_descarga(cols_emp), "ejemplo_empresas_compradoras.xlsx", "application/vnd.ms-excel")
+        ejemplo_emp = [['80098765-4', 'Empresa Compradora Uno SA']]
+        st.download_button("📥 Descargar Plantilla Ejemplo (Empresas Compradoras)", generar_excel_descarga(cols_emp, ejemplo_emp), "ejemplo_empresas_compradoras.xlsx", "application/vnd.ms-excel")
         up_emp = st.file_uploader("Subir planilla de empresas compradoras", type=["xlsx", "csv"], key="emp_up")
         if up_emp:
             df = pd.read_excel(up_emp) if up_emp.name.endswith('xlsx') else pd.read_csv(up_emp)
@@ -624,10 +769,35 @@ elif opcion_menu == "📥 Mapeador Masivo":
                             """, (clean_id(r['ruc']), str(r['razon_social']).strip()))
                 st.success("Empresas compradoras sincronizadas.")
 
-    # --- NUEVO (recomendado): carga masiva de Presupuestos por Área ---
+    # --- NUEVO (recomendado): Presupuestos por Área ---
     with t_presu:
+        st.markdown("#### ➕ Cargar un presupuesto")
+        with st.form("form_individual_presupuesto"):
+            fpr_area = st.text_input("Área")
+            fpr_empresa = st.text_input("RUC Empresa Compradora")
+            fpr_asignado = st.number_input("Monto Asignado", min_value=0.0, value=0.0)
+            fpr_utilizado = st.number_input("Monto Utilizado", min_value=0.0, value=0.0)
+            fpr_periodo = st.text_input("Período (ej. 2026-Q3)")
+            if st.form_submit_button("Guardar Presupuesto"):
+                if not fpr_area.strip() or not fpr_periodo.strip():
+                    st.error("Área y Período son obligatorios.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO presupuestos_area (area_name, empresa_ruc, monto_asignado, monto_utilizado, periodo)
+                                VALUES (%s, %s, %s, %s, %s)
+                                ON CONFLICT (area_name, empresa_ruc, periodo) DO UPDATE SET
+                                monto_asignado=EXCLUDED.monto_asignado, monto_utilizado=EXCLUDED.monto_utilizado
+                            """, (fpr_area.strip(), clean_id(fpr_empresa), float(fpr_asignado), float(fpr_utilizado), fpr_periodo.strip()))
+                    st.success(f"Presupuesto de {fpr_area} guardado.")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 📊 Carga masiva por Excel")
         cols_pres = ['area_name', 'empresa_ruc', 'monto_asignado', 'monto_utilizado', 'periodo']
-        st.download_button("📥 Descargar Plantilla Ejemplo (Presupuestos)", generar_excel_descarga(cols_pres), "ejemplo_presupuestos.xlsx", "application/vnd.ms-excel")
+        ejemplo_pres = [['Mantenimiento', '80098765-4', 50000000, 12500000, '2026-Q3']]
+        st.download_button("📥 Descargar Plantilla Ejemplo (Presupuestos)", generar_excel_descarga(cols_pres, ejemplo_pres), "ejemplo_presupuestos.xlsx", "application/vnd.ms-excel")
         up_pres = st.file_uploader("Subir planilla de presupuestos", type=["xlsx", "csv"], key="pres_up")
         if up_pres:
             df = pd.read_excel(up_pres) if up_pres.name.endswith('xlsx') else pd.read_csv(up_pres)
@@ -645,8 +815,51 @@ elif opcion_menu == "📥 Mapeador Masivo":
                 st.success("Presupuestos por área sincronizados.")
 
     with t_reqs:
+        st.markdown("#### ➕ Cargar una requisición (un ítem)")
+        st.caption("Para agregar más ítems a la misma requisición, use el mismo 'Código de Solicitación' varias veces, "
+                   "o use 'Control de Compras → Ítems → Agregar ítem adicional' una vez que ya exista.")
+        with st.form("form_individual_requisicion"):
+            fr_req_code = st.text_input("Código de Solicitación")
+            fr_situacao = st.selectbox("Situação Solici", ESTADOS_VALIDOS)
+            fr_pedido = st.text_input("Pedido (número de OC, '0' si aún no tiene)", value="0")
+            fr_data_aprova = st.date_input("Data Aprova", value=None)
+            fr_data_solicita = st.date_input("Data Solicita", value=datetime.now().date())
+            fr_email_comp = st.text_input("E-mail Comprador")
+            fr_email_aprov = st.text_input("E-mail Aprobador")
+            fr_email_solicit = st.text_input("E-mail Solicitante")
+            fr_item_codigo = st.text_input("Código de Ítem")
+            fr_narrativa = st.text_area("Narrativa del Ítem")
+            fr_cantidad = st.number_input("Cantidad Solicitada", min_value=1, value=1)
+
+            if st.form_submit_button("Guardar Requisición"):
+                if not fr_req_code.strip() or not fr_item_codigo.strip():
+                    st.error("Código de Solicitación y Código de Ítem son obligatorios.")
+                else:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            req_code_val = clean_id(fr_req_code)
+
+                            cursor.execute("SELECT area_name FROM areas_emails WHERE email = %s", (fr_email_solicit.strip(),))
+                            area_row = cursor.fetchone()
+                            assigned_area = area_row[0] if area_row else "Pendiente de Clasificación"
+
+                            cursor.execute("""
+                                INSERT INTO requisitions (req_code, situacao_solici, pedido, data_aprova, data_solicita, analista_email, aprobador_actual, area_name)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (req_code) DO UPDATE SET
+                                situacao_solici=EXCLUDED.situacao_solici, pedido=EXCLUDED.pedido, data_aprova=EXCLUDED.data_aprova, aprobador_actual=EXCLUDED.aprobador_actual, area_name=EXCLUDED.area_name
+                            """, (req_code_val, fr_situacao, fr_pedido.strip(), fr_data_aprova, fr_data_solicita,
+                                  fr_email_comp.strip(), fr_email_aprov.strip(), assigned_area))
+
+                            upsert_detalle_linea(cursor, req_code_val, clean_id(fr_item_codigo), fr_narrativa, safe_int(fr_cantidad))
+                    st.success(f"Requisición {req_code_val} guardada.")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 📊 Carga masiva por Excel")
         cols_r = ['Solicitação', 'Situação Solici', 'Pedido', 'Data Aprova', 'Data Solicita', 'E-mail Comp', 'E-mail Aprov', 'E-mail Solicit', 'Código Item', 'Narrativa Item', 'Cantidad Solicitada']
-        st.download_button("📥 Descargar Estructura Maestro de Compras", generar_excel_descarga(cols_r), "plantilla_maestro.xlsx", "application/vnd.ms-excel")
+        ejemplo_r = [['14660', 'Pendiente de aprobación', '0', '', '2026-07-01', 'comprador@ejemplo.com',
+                      'aprobador@ejemplo.com', 'celeste.benitez@ejemplo.com', 'IT-0001', 'Guantes de nitrilo talla M', 20]]
+        st.download_button("📥 Descargar Estructura Maestro de Compras", generar_excel_descarga(cols_r, ejemplo_r), "plantilla_maestro.xlsx", "application/vnd.ms-excel")
         up_r = st.file_uploader("Arrastra el archivo maestro consolidado aquí", type=["xlsx", "csv"], key="r_up")
         if up_r:
             df = pd.read_excel(up_r) if up_r.name.endswith('xlsx') else pd.read_csv(up_r)
@@ -655,10 +868,7 @@ elif opcion_menu == "📥 Mapeador Masivo":
                     with conn.cursor() as cursor:
                         # --- FIX Bug #3: ya NO se hace DELETE masivo de requisitions_detalles.
                         # El DELETE previo pisaba cantidad_comprador ya auditada por Compras.
-                        # Ahora se hace UPSERT línea por línea: si la línea ya existe y
-                        # cantidad_comprador ya fue modificada por Compras (difiere de la
-                        # cantidad_solicitada original), se preserva. Si nunca fue tocada,
-                        # se actualiza junto con la nueva cantidad solicitada.
+                        # Ahora se hace UPSERT línea por línea vía upsert_detalle_linea().
                         for _, row in df.iterrows():
                             req_code_val = clean_id(row['Solicitação'])
                             d_aprova = pd.to_datetime(row['Data Aprova']).date() if pd.notnull(row['Data Aprova']) else None
@@ -678,34 +888,7 @@ elif opcion_menu == "📥 Mapeador Masivo":
                             item_cod = clean_id(row['Código Item'])
                             narrativa = str(row['Narrativa Item'])
 
-                            cursor.execute("""
-                                SELECT id, cantidad_solicitada, cantidad_comprador
-                                FROM requisitions_detalles
-                                WHERE requisicion_id = %s AND item_codigo = %s
-                            """, (req_code_val, item_cod))
-                            existing = cursor.fetchone()
-
-                            if existing:
-                                existing_id, existing_cant_sol, existing_cant_comp = existing
-                                if existing_cant_comp == existing_cant_sol:
-                                    # Compras nunca auditó esta línea: se sincroniza normalmente
-                                    cursor.execute("""
-                                        UPDATE requisitions_detalles
-                                        SET cantidad_solicitada = %s, narrativa_solicitante = %s, cantidad_comprador = %s
-                                        WHERE id = %s
-                                    """, (cantidad, narrativa, cantidad, existing_id))
-                                else:
-                                    # Compras ya audito cantidad_comprador: se preserva
-                                    cursor.execute("""
-                                        UPDATE requisitions_detalles
-                                        SET cantidad_solicitada = %s, narrativa_solicitante = %s
-                                        WHERE id = %s
-                                    """, (cantidad, narrativa, existing_id))
-                            else:
-                                cursor.execute("""
-                                    INSERT INTO requisitions_detalles (requisicion_id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador)
-                                    VALUES (%s, %s, %s, %s, %s)
-                                """, (req_code_val, item_cod, narrativa, cantidad, cantidad))
+                            upsert_detalle_linea(cursor, req_code_val, item_cod, narrativa, cantidad)
                 st.success("Estructura transaccional mapeada con total integridad en Supabase (cantidad_comprador auditada se preserva).")
 
 # 4. CUADRO COMPARATIVO MASIVO Y FLUJO DE APROBACIÓN JERÁRQUICA
