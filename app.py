@@ -162,11 +162,6 @@ def init_db():
                     fecha_cambio TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # --- NUEVO (Requerimiento 7): tabla de reglas de flujo de aprobación ---
-            # Versión simple inicial: guarda condiciones que a futuro pueden usarse
-            # para determinar la secuencia de aprobación requerida según monto/área/
-            # empresa/tipo de compra. No se conecta aún a lógica automática de ruteo;
-            # eso queda para una siguiente iteración según lo indicado en el informe.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS reglas_flujo (
                     id SERIAL PRIMARY KEY,
@@ -180,14 +175,18 @@ def init_db():
                 )
             """)
 
-            # --- NUEVO (Fase 4 y 5): columnas adicionales, agregadas de forma NO
-            # destructiva con ADD COLUMN IF NOT EXISTS. No se toca ningún dato existente.
+            # --- Columnas adicionales agregadas de forma NO destructiva ---
             cursor.execute("ALTER TABLE requisitions ADD COLUMN IF NOT EXISTS empresa_ruc TEXT")
             cursor.execute("ALTER TABLE requisitions ADD COLUMN IF NOT EXISTS fecha_comprometida DATE")
             cursor.execute("ALTER TABLE requisitions_detalles ADD COLUMN IF NOT EXISTS cantidad_recibida INTEGER DEFAULT 0")
             cursor.execute("ALTER TABLE requisitions_detalles ADD COLUMN IF NOT EXISTS estado_recepcion TEXT DEFAULT 'Pendiente'")
 
-            # --- NUEVO (Requerimiento 4): Empresa Compradora (16 RUC distintos) ---
+            # --- NUEVO (este fix): campo "nombre" para el catálogo de ítems ---
+            # El código sigue existiendo (y se sigue usando como PK / referencia
+            # interna), pero ahora también hay un nombre legible por el cual
+            # se puede buscar y mostrar el ítem en toda la app.
+            cursor.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS nombre TEXT")
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS empresas_compradoras (
                     id SERIAL PRIMARY KEY,
@@ -207,10 +206,6 @@ def init_db():
                 )
             """)
 
-            # --- NUEVO (Requerimiento 9): Gestión documental ---
-            # MVP: se guarda el contenido como BYTEA directamente en Postgres para no
-            # sumar una dependencia nueva (supabase-py / Storage SDK). Si más adelante
-            # se prefiere Supabase Storage, se puede migrar sin tocar la interfaz.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS documentos_adjuntos (
                     id SERIAL PRIMARY KEY,
@@ -223,9 +218,6 @@ def init_db():
                 )
             """)
 
-            # --- NUEVO (Requerimiento 10): Notificaciones automáticas ---
-            # MVP: log de notificaciones pendientes en base de datos (no envío de email real,
-            # tal como habilita el informe: "como mínimo un log de notificaciones pendientes").
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS notificaciones_pendientes (
                     id SERIAL PRIMARY KEY,
@@ -237,7 +229,6 @@ def init_db():
                 )
             """)
 
-            # --- NUEVO (recomendado): Control de presupuesto disponible ---
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS presupuestos_area (
                     id SERIAL PRIMARY KEY,
@@ -285,27 +276,18 @@ def generar_excel_descarga(columnas, data=None):
         df.to_excel(writer, index=False, sheet_name='Plantilla Modelo')
     return output.getvalue()
 
-# --- NUEVO (Requerimiento 5): set completo de estados del proceso ---
-# Reemplaza el uso de texto libre en situacao_solici. Se mantiene compatibilidad
-# con valores ya cargados en producción (ver sidebar, que fusiona estos con los
-# que ya existan en la base) para no romper filtros de datos históricos.
 ESTADOS_VALIDOS = [
     "Borrador", "Pendiente de aprobación", "En aprobación", "Aprobada", "Rechazada",
     "En cotización", "En negociación", "Orden de Compra emitida", "Parcialmente atendida",
     "Recepción parcial", "Recepción completa", "Cerrada", "Cancelada", "Anulada"
 ]
 
-# --- NUEVO (Requerimiento 10): helper de notificaciones automáticas (log mínimo) ---
 def registrar_notificacion(cursor, req_code, tipo_evento, mensaje):
     cursor.execute("""
         INSERT INTO notificaciones_pendientes (requisicion_id, tipo_evento, mensaje)
         VALUES (%s, %s, %s)
     """, (req_code, tipo_evento, mensaje))
 
-# --- NUEVO: helper reusado por la carga masiva Y por el alta individual de la
-# Planilla Maestro de Requisiciones. Aplica el mismo criterio del FIX Bug #3:
-# si la línea ya existe y cantidad_comprador ya fue auditada por Compras
-# (difiere de cantidad_solicitada), se preserva; si nunca fue tocada, se sincroniza.
 def upsert_detalle_linea(cursor, req_code_val, item_cod, narrativa, cantidad):
     cursor.execute("""
         SELECT id, cantidad_solicitada, cantidad_comprador
@@ -334,13 +316,6 @@ def upsert_detalle_linea(cursor, req_code_val, item_cod, narrativa, cantidad):
             VALUES (%s, %s, %s, %s, %s)
         """, (req_code_val, item_cod, narrativa, cantidad, cantidad))
 
-# --- NUEVO: Control de presupuesto disponible por área (bloqueante) ---
-# MVP: se suma el saldo disponible (monto_asignado - monto_utilizado) de TODAS las
-# filas de presupuestos_area que coincidan con el área, sin distinguir por empresa
-# compradora ni período. Es una simplificación deliberada: al crear la solicitud
-# todavía no existe cotización ni empresa compradora asignada, así que solo se
-# puede validar "¿el área tiene saldo mayor a cero en algún presupuesto cargado?".
-# El chequeo fino por monto real se hace después, en el Cuadro Comparativo.
 def obtener_saldo_disponible(area_name):
     if not area_name:
         return 0.0
@@ -349,6 +324,58 @@ def obtener_saldo_disponible(area_name):
         get_engine(), params={"a": area_name}
     )
     return float(df_saldo.iloc[0]['disponible']) if not df_saldo.empty else 0.0
+
+# --- NUEVO (este fix): numeración automática de código de ítem ---
+# Formato IT-0001, IT-0002, ... Se calcula en base al máximo código IT-XXXX
+# ya cargado, ignorando (sin romper) cualquier código legado que no siga
+# ese patrón (p. ej. códigos cargados manualmente antes de este cambio).
+def generar_siguiente_codigo_item(cursor):
+    cursor.execute("SELECT codigo FROM items WHERE codigo LIKE 'IT-%'")
+    codigos = cursor.fetchall()
+    max_num = 0
+    for (cod,) in codigos:
+        try:
+            num = int(str(cod).replace('IT-', '').strip())
+            if num > max_num:
+                max_num = num
+        except ValueError:
+            continue
+    return f"IT-{max_num + 1:04d}"
+
+# --- NUEVO (este fix): catálogo de ítems para selectboxes con nombre visible ---
+def obtener_catalogo_items():
+    return pd.read_sql_query(
+        "SELECT codigo, COALESCE(nombre, '(sin nombre)') AS nombre, descripcion_estandar, unidad_medida "
+        "FROM items ORDER BY nombre",
+        get_engine()
+    )
+
+def selector_item(label, key=None, help_text=None):
+    """Devuelve (codigo_seleccionado, df_catalogo). Muestra 'código — nombre'."""
+    df_cat = obtener_catalogo_items()
+    if df_cat.empty:
+        st.warning("No hay ítems cargados en el catálogo todavía.")
+        return None, df_cat
+    etiquetas = {row['codigo']: f"{row['codigo']} — {row['nombre']}" for _, row in df_cat.iterrows()}
+    seleccion = st.selectbox(
+        label, df_cat['codigo'].tolist(),
+        format_func=lambda c: etiquetas.get(c, c), key=key, help=help_text
+    )
+    return seleccion, df_cat
+
+# --- NUEVO (este fix): numeración automática robusta de requisiciones ---
+# Se usa una expresión regular para tomar en cuenta solo los req_code que
+# son puramente numéricos, evitando que un código legado no-numérico rompa
+# el cálculo del siguiente correlativo.
+def generar_siguiente_req_code(cursor):
+    cursor.execute("""
+        SELECT req_code FROM requisitions
+        WHERE req_code ~ '^[0-9]+$'
+        ORDER BY req_code::bigint DESC LIMIT 1
+    """)
+    ultimo = cursor.fetchone()
+    siguiente_num = int(ultimo[0]) + 1 if ultimo else 100000
+    return str(siguiente_num)
 
 
 # =====================================================================
@@ -403,15 +430,20 @@ st.sidebar.markdown("---")
 
 st.sidebar.subheader("🗂️ Módulos del Sistema")
 
-# --- FIX Bug #5 + NUEVO (Requerimiento 12): Roles y permisos reales ---
-# Antes: "📥 Mapeador Masivo" estaba disponible para CUALQUIER usuario autenticado.
-# Ahora: cada rol tiene un set explícito de menús permitidos. Solo Comprador y
-# Administración ven el Mapeador Masivo (que puede sobrescribir toda la base).
+# --- Roles y permisos ---
+# NUEVO (este fix): se agrega "📋 Reportes de Requisiciones" a TODOS los roles.
+# Es una vista de solo lectura: cualquiera puede ver el número de requisición,
+# sus ítems (con nombre) y en qué nivel de aprobación está. La MODIFICACIÓN
+# real de esos datos sigue reservada a "🛠️ Control de Compras", que solo
+# aparece para comprador/administración, como ya estaba.
+REPORTES_MENU = "📋 Reportes de Requisiciones"
+
 ROLE_MENU_MAP = {
     "solicitante": [
         "🏢 Estructura Organizacional",
         "🤝 Gestión de Proveedores",
         "📝 Nueva Solicitud",
+        REPORTES_MENU,
         "🔍 Buscador Rápido",
     ],
     "jefe de área": [
@@ -419,6 +451,7 @@ ROLE_MENU_MAP = {
         "🤝 Gestión de Proveedores",
         "📝 Nueva Solicitud",
         "⚖️ Cuadro Comparativo Masivo",
+        REPORTES_MENU,
         "🔍 Buscador Rápido",
     ],
     "comprador": [
@@ -428,6 +461,7 @@ ROLE_MENU_MAP = {
         "⚖️ Cuadro Comparativo Masivo",
         "🛠️ Control de Compras",
         "📊 Dashboard Ejecutivo",
+        REPORTES_MENU,
         "✅ Aprobar / Rechazar",
         "🔍 Buscador Rápido",
         "🔔 Notificaciones",
@@ -437,6 +471,7 @@ ROLE_MENU_MAP = {
         "🤝 Gestión de Proveedores",
         "⚖️ Cuadro Comparativo Masivo",
         "📊 Dashboard Ejecutivo",
+        REPORTES_MENU,
         "✅ Aprobar / Rechazar",
         "🔍 Buscador Rápido",
         "🔔 Notificaciones",
@@ -446,6 +481,7 @@ ROLE_MENU_MAP = {
         "🤝 Gestión de Proveedores",
         "⚖️ Cuadro Comparativo Masivo",
         "📊 Dashboard Ejecutivo",
+        REPORTES_MENU,
         "✅ Aprobar / Rechazar",
         "🔍 Buscador Rápido",
         "🔔 Notificaciones",
@@ -454,6 +490,7 @@ ROLE_MENU_MAP = {
         "🏢 Estructura Organizacional",
         "🤝 Gestión de Proveedores",
         "📊 Dashboard Ejecutivo",
+        REPORTES_MENU,
         "🔍 Buscador Rápido",
         "🔔 Notificaciones",
     ],
@@ -464,17 +501,17 @@ ROLE_MENU_MAP = {
         "⚖️ Cuadro Comparativo Masivo",
         "🛠️ Control de Compras",
         "📊 Dashboard Ejecutivo",
+        REPORTES_MENU,
         "✅ Aprobar / Rechazar",
         "🔍 Buscador Rápido",
         "🔔 Notificaciones",
     ],
-    # Compatibilidad retroactiva: el rol "aprobador" ya está cargado en producción
-    # (tabla usuarios) y no debe perder acceso mientras se migra a los roles nuevos.
     "aprobador": [
         "🏢 Estructura Organizacional",
         "🤝 Gestión de Proveedores",
         "⚖️ Cuadro Comparativo Masivo",
         "📊 Dashboard Ejecutivo",
+        REPORTES_MENU,
         "✅ Aprobar / Rechazar",
         "🔍 Buscador Rápido",
     ],
@@ -482,17 +519,13 @@ ROLE_MENU_MAP = {
 
 opciones_permitidas = ROLE_MENU_MAP.get(
     st.session_state.user_role,
-    ["🏢 Estructura Organizacional", "🤝 Gestión de Proveedores"]  # default mínimo seguro para roles no reconocidos
+    ["🏢 Estructura Organizacional", "🤝 Gestión de Proveedores", REPORTES_MENU]
 )
 
 opcion_menu = st.sidebar.radio("Seleccione una sección:", opciones_permitidas)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎛️ Filtros Gerenciales")
-# --- FIX Bug #1 (mejora): el listado de estados ya no es una lista fija hardcodeada.
-# Se fusiona ESTADOS_VALIDOS (Requerimiento 5) con los valores que ya existan
-# realmente en la base (legado), para que el filtro nunca quede desactualizado
-# ni oculte datos históricos con nomenclatura anterior.
 try:
     df_estados_existentes = pd.read_sql_query(
         "SELECT DISTINCT situacao_solici FROM requisitions WHERE situacao_solici IS NOT NULL", get_engine()
@@ -556,7 +589,6 @@ if opcion_menu == "🏢 Estructura Organizacional":
 elif opcion_menu == "🤝 Gestión de Proveedores":
     st.subheader("Directorio Maestro e Indicadores de Operabilidad")
     try:
-        # --- FIX Bug #4: faltaban flexibility_score, financial_health_score y general_notes ---
         df_prov = pd.read_sql_query("""
             SELECT ruc AS "RUC", name AS "Razón Social", email AS "Email Comercial",
                    delivery_score AS "Score Entrega", quality_score AS "Score Calidad",
@@ -580,7 +612,6 @@ elif opcion_menu == "📥 Mapeador Masivo":
     st.caption("Cada pestaña permite cargar un registro individual directamente en pantalla, "
                "o subir un Excel con muchos registros a la vez.")
 
-    # --- FIX Bug #2 + NUEVO (Requerimiento 4 y recomendado de presupuesto) ---
     t_usuarios, t_items, t_prov, t_areas, t_empresas, t_presu, t_reqs = st.tabs([
         "👥 Carga de Usuarios", "📦 Catálogo de Ítems", "🏢 Directorio Proveedores",
         "🗺️ Áreas y Emails", "🏦 Empresas Compradoras", "💰 Presupuestos",
@@ -628,30 +659,56 @@ elif opcion_menu == "📥 Mapeador Masivo":
                             """, (r['nombre'], r['email'], r['rol'], r['nivel_aprobacion'], safe_int(r['secuencia_orden'])))
                 st.success("Usuarios sincronizados masivamente.")
 
+    # =========================================================
+    # NUEVO (este fix): Catálogo de Ítems con código autogenerado,
+    # nombre buscable, y buscador antes de crear uno nuevo (para
+    # evitar duplicados).
+    # =========================================================
     with t_items:
-        st.markdown("#### ➕ Cargar un ítem")
+        st.markdown("#### 🔍 Buscar ítems ya cargados")
+        buscar_item_txt = st.text_input(
+            "Buscar por nombre, código o descripción",
+            key="buscar_item_catalogo",
+            placeholder="Ej: guantes, IT-0001, nitrilo..."
+        )
+        query_items_base = "SELECT codigo, COALESCE(nombre,'(sin nombre)') AS nombre, descripcion_estandar, unidad_medida FROM items"
+        if buscar_item_txt:
+            df_items_existentes = pd.read_sql_query(
+                query_items_base + " WHERE nombre ILIKE %(t)s OR codigo ILIKE %(t)s OR descripcion_estandar ILIKE %(t)s ORDER BY nombre",
+                get_engine(), params={"t": f"%{buscar_item_txt}%"}
+            )
+        else:
+            df_items_existentes = pd.read_sql_query(query_items_base + " ORDER BY nombre", get_engine())
+        st.dataframe(df_items_existentes, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("#### ➕ Cargar un ítem nuevo")
+        st.caption("El código se asigna automáticamente (formato IT-0001, IT-0002, ...). "
+                   "Solo debe indicar el nombre (por el cual se podrá buscar) y opcionalmente una descripción y unidad de medida.")
         with st.form("form_individual_item"):
-            fi_codigo = st.text_input("Código")
-            fi_desc = st.text_input("Descripción estándar")
+            fi_nombre = st.text_input("Nombre del Ítem (obligatorio)")
+            fi_desc = st.text_input("Descripción estándar / especificación")
             fi_unidad = st.text_input("Unidad de medida")
             if st.form_submit_button("Guardar Ítem"):
-                if not fi_codigo.strip():
-                    st.error("El código es obligatorio.")
+                if not fi_nombre.strip():
+                    st.error("El nombre del ítem es obligatorio.")
                 else:
                     with get_db_connection() as conn:
                         with conn.cursor() as cursor:
+                            nuevo_codigo_item = generar_siguiente_codigo_item(cursor)
                             cursor.execute("""
-                                INSERT INTO items (codigo, descripcion_estandar, unidad_medida)
-                                VALUES (%s, %s, %s) ON CONFLICT (codigo) DO UPDATE SET
-                                descripcion_estandar=EXCLUDED.descripcion_estandar, unidad_medida=EXCLUDED.unidad_medida
-                            """, (clean_id(fi_codigo), fi_desc.strip(), fi_unidad.strip()))
-                    st.success(f"Ítem {fi_codigo} guardado.")
+                                INSERT INTO items (codigo, nombre, descripcion_estandar, unidad_medida)
+                                VALUES (%s, %s, %s, %s)
+                            """, (nuevo_codigo_item, fi_nombre.strip(), fi_desc.strip(), fi_unidad.strip()))
+                    st.success(f"Ítem **{fi_nombre}** guardado con código **{nuevo_codigo_item}**.")
                     st.rerun()
 
         st.markdown("---")
         st.markdown("#### 📊 Carga masiva por Excel")
-        cols_i = ['codigo', 'descripcion_estandar', 'unidad_medida']
-        ejemplo_i = [['IT-0001', 'Guantes de nitrilo talla M', 'Caja x100']]
+        st.caption("Nota: en la carga masiva todos los ítems se crean como registros nuevos "
+                   "(el código se asigna automáticamente), no se actualizan ítems existentes por esta vía.")
+        cols_i = ['nombre', 'descripcion_estandar', 'unidad_medida']
+        ejemplo_i = [['Guantes de nitrilo talla M', 'Guantes de nitrilo talla M, caja x100', 'Caja x100']]
         st.download_button("📥 Descargar Plantilla Ejemplo (Ítems)", generar_excel_descarga(cols_i, ejemplo_i), "ejemplo_items.xlsx", "application/vnd.ms-excel")
         up_i = st.file_uploader("Subir planilla del catálogo", type=["xlsx", "csv"], key="i_up")
         if up_i:
@@ -660,12 +717,18 @@ elif opcion_menu == "📥 Mapeador Masivo":
                 with get_db_connection() as conn:
                     with conn.cursor() as cursor:
                         for _, r in df.iterrows():
+                            nombre_val = str(r['nombre']).strip()
+                            if not nombre_val or nombre_val.lower() == 'nan':
+                                continue
+                            nuevo_codigo_item = generar_siguiente_codigo_item(cursor)
                             cursor.execute("""
-                                INSERT INTO items (codigo, descripcion_estandar, unidad_medida)
-                                VALUES (%s, %s, %s) ON CONFLICT (codigo) DO UPDATE SET
-                                descripcion_estandar=EXCLUDED.descripcion_estandar, unidad_medida=EXCLUDED.unidad_medida
-                            """, (clean_id(r['codigo']), r['descripcion_estandar'], r['unidad_medida']))
-                st.success("Catálogo maestro actualizado sin duplicados.")
+                                INSERT INTO items (codigo, nombre, descripcion_estandar, unidad_medida)
+                                VALUES (%s, %s, %s, %s)
+                            """, (nuevo_codigo_item, nombre_val,
+                                  str(r.get('descripcion_estandar', '')).strip(),
+                                  str(r.get('unidad_medida', '')).strip()))
+                st.success("Catálogo maestro actualizado. Se asignó código automático a cada ítem nuevo.")
+                st.rerun()
 
     with t_prov:
         st.markdown("#### ➕ Cargar un proveedor")
@@ -707,7 +770,6 @@ elif opcion_menu == "📥 Mapeador Masivo":
                             """, (clean_id(r['ruc']), r['name'], r['email'], clean_id(r['contact_phone'])))
                 st.success("Proveedores dados de alta de manera masiva.")
 
-    # --- NUEVO Bug #2: carga masiva de areas_emails (mismo patrón que t_prov) ---
     with t_areas:
         st.markdown("#### ➕ Cargar un área")
         with st.form("form_individual_area"):
@@ -746,7 +808,6 @@ elif opcion_menu == "📥 Mapeador Masivo":
                             """, (str(r['area_name']).strip(), str(r['email']).strip()))
                 st.success("Mapeo de áreas y emails actualizado sin duplicados.")
 
-    # --- NUEVO (Requerimiento 4): Empresas Compradoras (16 RUC) ---
     with t_empresas:
         st.markdown("#### ➕ Cargar una empresa compradora")
         with st.form("form_individual_empresa"):
@@ -785,7 +846,6 @@ elif opcion_menu == "📥 Mapeador Masivo":
                             """, (clean_id(r['ruc']), str(r['razon_social']).strip()))
                 st.success("Empresas compradoras sincronizadas.")
 
-    # --- NUEVO (recomendado): Presupuestos por Área ---
     with t_presu:
         st.markdown("#### ➕ Cargar un presupuesto")
         with st.form("form_individual_presupuesto"):
@@ -882,9 +942,6 @@ elif opcion_menu == "📥 Mapeador Masivo":
             if st.button("🚀 Ejecutar Motor de Integridad Correlativa"):
                 with get_db_connection() as conn:
                     with conn.cursor() as cursor:
-                        # --- FIX Bug #3: ya NO se hace DELETE masivo de requisitions_detalles.
-                        # El DELETE previo pisaba cantidad_comprador ya auditada por Compras.
-                        # Ahora se hace UPSERT línea por línea vía upsert_detalle_linea().
                         for _, row in df.iterrows():
                             req_code_val = clean_id(row['Solicitação'])
                             d_aprova = pd.to_datetime(row['Data Aprova']).date() if pd.notnull(row['Data Aprova']) else None
@@ -909,7 +966,6 @@ elif opcion_menu == "📥 Mapeador Masivo":
 
 # 4. CUADRO COMPARATIVO MASIVO Y FLUJO DE APROBACIÓN JERÁRQUICA
 elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
-    # --- FIX Bug #1: se aplica status_filter para acotar qué requisiciones se gestionan aquí ---
     if status_filter:
         df_reqs_filtradas = pd.read_sql_query(
             "SELECT req_code FROM requisitions WHERE situacao_solici = ANY(%(estados)s) ORDER BY req_code",
@@ -929,13 +985,15 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
     col_acc1, col_acc2 = st.columns(2)
     with col_acc1:
         st.markdown("### Paso 1: Obtener Plantilla Estructurada")
-        df_detalles_plantilla = pd.read_sql_query(
-            "SELECT item_codigo, narrativa_solicitante, cantidad_solicitada FROM requisitions_detalles WHERE requisicion_id = %(req)s",
-            get_engine(),
-            params={"req": c_req_code}
-        )
+        df_detalles_plantilla = pd.read_sql_query("""
+            SELECT d.item_codigo, COALESCE(i.nombre,'(sin nombre)') AS item_nombre,
+                   d.narrativa_solicitante, d.cantidad_solicitada
+            FROM requisitions_detalles d LEFT JOIN items i ON d.item_codigo = i.codigo
+            WHERE d.requisicion_id = %(req)s
+        """, get_engine(), params={"req": c_req_code})
 
         if not df_detalles_plantilla.empty:
+            st.dataframe(df_detalles_plantilla, use_container_width=True)
             cols_presupuesto = ['proveedor_ruc', 'precio_total_usd', 'plazo_pago_dias', 'tiempo_entrega_dias']
             df_plantilla_out = pd.DataFrame(columns=cols_presupuesto)
             df_plantilla_out['item_codigo_requerido'] = df_detalles_plantilla['item_codigo']
@@ -953,10 +1011,6 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
         if up_quotes:
             df_q = pd.read_excel(up_quotes)
             if st.button("🚀 Consolidar Cuadro Comparativo y Disparar Flujo Jerárquico"):
-                # --- NUEVO: Control de presupuesto disponible (bloqueante, chequeo fino) ---
-                # Acá sí conocemos el monto real: se usa la cotización MÁS BAJA subida
-                # como estimación conservadora del compromiso (Compras podrá refinar
-                # la elección de proveedor después en "Control de Compras").
                 cursor_area_check = pd.read_sql_query(
                     "SELECT area_name FROM requisitions WHERE req_code = %(req)s", get_engine(), params={"req": c_req_code}
                 )
@@ -977,11 +1031,6 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
                                     VALUES (%s, %s, %s, %s, %s)
                                 """, (c_req_code, clean_id(r['proveedor_ruc']), float(r['precio_total_usd']), safe_int(r['plazo_pago_dias']), safe_int(r['tiempo_entrega_dias'])))
 
-                            # --- FIX: el flujo quedaba huérfano porque nunca se asignaba
-                            # aprobador_actual. Se busca al primer aprobador de la cadena
-                            # (secuencia_orden = 1) y se lo asigna explícitamente; sin esto,
-                            # la bandeja de "Aprobar / Rechazar" nunca mostraba la requisición
-                            # a nadie, porque esa pantalla filtra por aprobador_actual = email.
                             cursor.execute("""
                                 SELECT email FROM usuarios
                                 WHERE rol = 'aprobador' AND secuencia_orden = 1
@@ -1005,7 +1054,6 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
                                     WHERE req_code = %s
                                 """, (c_req_code,))
 
-                            # NUEVO (Requerimiento 10): notificación mínima de evento
                             registrar_notificacion(cursor, c_req_code, 'pendiente_aprobacion',
                                                     f"La requisición {c_req_code} quedó pendiente de aprobación tras cargar cotizaciones.")
 
@@ -1036,7 +1084,6 @@ elif opcion_menu == "⚖️ Cuadro Comparativo Masivo":
 
 # 5. DASHBOARD EJECUTIVO
 elif opcion_menu == "📊 Dashboard Ejecutivo":
-    # --- FIX Bug #1: se aplica status_filter a la query base del dashboard ---
     if status_filter:
         df_db = pd.read_sql_query(
             "SELECT * FROM requisitions WHERE situacao_solici = ANY(%(estados)s)",
@@ -1068,7 +1115,6 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
             fig_aprov = px.histogram(df_db, x='aprobador_actual', title="Carga Dinámica de Órdenes Retenidas por Autorizante")
             st.plotly_chart(fig_aprov, use_container_width=True)
 
-        # --- NUEVO (Requerimiento 11): Reportes e indicadores ampliados ---
         st.markdown("---")
         st.subheader("📈 Reportes Ampliados")
         rep1, rep2 = st.columns(2)
@@ -1086,24 +1132,22 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
             fig_empresa_rep = px.bar(df_compras_empresa, x='empresa_ruc', y='cantidad', title="Compras por Empresa Compradora")
             st.plotly_chart(fig_empresa_rep, use_container_width=True)
 
-        # Órdenes vencidas: fecha_comprometida ya pasada y sin recepción completa
         if 'fecha_comprometida' in df_db.columns:
             fechas_compr = pd.to_datetime(df_db['fecha_comprometida'], errors='coerce').dt.date
             vencidas_mask = fechas_compr.notna() & (fechas_compr < hoy)
             st.metric("📌 Órdenes con Fecha Comprometida Vencida", int(vencidas_mask.sum()))
 
-        # Exportación real a Excel (Requerimiento 11)
         output_rep = io.BytesIO()
         with pd.ExcelWriter(output_rep, engine='xlsxwriter') as writer:
             df_db.drop(columns=['data_aprova_dt'], errors='ignore').to_excel(writer, index=False, sheet_name='Reporte Requisiciones')
         st.download_button("📥 Exportar Reporte Completo a Excel", output_rep.getvalue(), "reporte_requisiciones.xlsx", "application/vnd.ms-excel")
 
-        # --- NUEVO (recomendado): Alertas de compras duplicadas ---
         st.markdown("---")
         st.subheader("⚠️ Alertas de Posibles Compras Duplicadas")
         df_dupes = pd.read_sql_query("""
-            SELECT item_codigo, requisicion_id, COUNT(*) OVER (PARTITION BY item_codigo) AS repeticiones
-            FROM requisitions_detalles
+            SELECT d.item_codigo, COALESCE(i.nombre,'(sin nombre)') AS item_nombre, d.requisicion_id,
+                   COUNT(*) OVER (PARTITION BY d.item_codigo) AS repeticiones
+            FROM requisitions_detalles d LEFT JOIN items i ON d.item_codigo = i.codigo
         """, get_engine())
         df_dupes_flag = df_dupes[df_dupes['repeticiones'] > 1]
         if not df_dupes_flag.empty:
@@ -1116,11 +1160,12 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
 
         select_req = st.selectbox("Seleccione el código de orden a auditar cantidades:", df_db['req_code'].unique())
 
-        df_detalles = pd.read_sql_query(
-            "SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = %(req)s",
-            get_engine(),
-            params={"req": select_req}
-        )
+        df_detalles = pd.read_sql_query("""
+            SELECT d.id, d.item_codigo, COALESCE(i.nombre,'(sin nombre)') AS item_nombre,
+                   d.narrativa_solicitante, d.cantidad_solicitada, d.cantidad_comprador
+            FROM requisitions_detalles d LEFT JOIN items i ON d.item_codigo = i.codigo
+            WHERE d.requisicion_id = %(req)s
+        """, get_engine(), params={"req": select_req})
 
         if not df_detalles.empty:
             st.dataframe(df_detalles, use_container_width=True)
@@ -1149,7 +1194,7 @@ elif opcion_menu == "📊 Dashboard Ejecutivo":
     else:
         st.info("No se registran datos en la nube.")
 
-# 6. APROBAR / RECHAZAR (NUEVO — Requerimiento 7, flujo de aprobación real)
+# 6. APROBAR / RECHAZAR
 elif opcion_menu == "✅ Aprobar / Rechazar":
     st.subheader("Bandeja de Aprobación Pendiente")
     st.caption("Se listan las requisiciones donde usted figura como aprobador actual en la cadena secuencial.")
@@ -1167,6 +1212,19 @@ elif opcion_menu == "✅ Aprobar / Rechazar":
         st.dataframe(df_pendientes, use_container_width=True)
         req_a_resolver = st.selectbox("Seleccione la requisición a resolver:", df_pendientes['req_code'].tolist())
 
+        # NUEVO (este fix): se muestra el contenido (ítems con nombre) de la
+        # requisición seleccionada antes de aprobar/rechazar, para que el
+        # aprobador vea qué está autorizando.
+        df_items_aprobar = pd.read_sql_query("""
+            SELECT d.item_codigo AS "Código", COALESCE(i.nombre,'(sin nombre)') AS "Nombre del Ítem",
+                   d.narrativa_solicitante AS "Descripción/Narrativa",
+                   d.cantidad_solicitada AS "Cant. Solicitada", d.cantidad_comprador AS "Cant. Autorizada"
+            FROM requisitions_detalles d LEFT JOIN items i ON d.item_codigo = i.codigo
+            WHERE d.requisicion_id = %(req)s
+        """, get_engine(), params={"req": req_a_resolver})
+        st.markdown("**Contenido de la requisición:**")
+        st.dataframe(df_items_aprobar, use_container_width=True)
+
         col_ap, col_re = st.columns(2)
 
         with col_ap:
@@ -1177,7 +1235,6 @@ elif opcion_menu == "✅ Aprobar / Rechazar":
                         cursor.execute("SELECT secuencia_aprobacion_actual FROM requisitions WHERE req_code = %s", (req_a_resolver,))
                         seq_actual = cursor.fetchone()[0]
 
-                        # Busca el siguiente aprobador en la cadena según secuencia_orden
                         cursor.execute("""
                             SELECT email FROM usuarios
                             WHERE rol = 'aprobador' AND secuencia_orden > %s
@@ -1195,7 +1252,6 @@ elif opcion_menu == "✅ Aprobar / Rechazar":
                             """, (siguiente[0], req_a_resolver))
                             nuevo_estado = 'En aprobación'
                         else:
-                            # Era el último aprobador de la cadena
                             cursor.execute("""
                                 UPDATE requisitions
                                 SET situacao_solici = 'Aprobada'
@@ -1203,12 +1259,6 @@ elif opcion_menu == "✅ Aprobar / Rechazar":
                             """, (req_a_resolver,))
                             nuevo_estado = 'Aprobada'
 
-                            # --- NUEVO: débito automático de presupuesto al aprobar en firme ---
-                            # Se usa el precio de la cotización marcada como seleccionada
-                            # (budgets.seleccionado = TRUE, definida en "Control de Compras");
-                            # si Compras todavía no seleccionó ninguna, se usa la más baja
-                            # cargada como respaldo (misma estimación conservadora del
-                            # chequeo hecho al disparar el flujo).
                             cursor.execute("""
                                 SELECT price FROM budgets WHERE req_code = %s AND seleccionado = TRUE LIMIT 1
                             """, (req_a_resolver,))
@@ -1225,9 +1275,6 @@ elif opcion_menu == "✅ Aprobar / Rechazar":
                                 area_req_val = area_req_row[0] if area_req_row else None
 
                                 if area_req_val:
-                                    # MVP: se debita de UNA sola fila de presupuestos_area (la de
-                                    # mayor saldo disponible para esa área), sin prorratear entre
-                                    # varios períodos/empresas si hubiera más de una fila cargada.
                                     cursor.execute("""
                                         SELECT id FROM presupuestos_area
                                         WHERE area_name = %s
@@ -1275,16 +1322,12 @@ elif opcion_menu == "✅ Aprobar / Rechazar":
                     st.success(f"Requisición {req_a_resolver} rechazada y registrada en trazabilidad.")
                     st.rerun()
 
-# 7. NUEVA SOLICITUD (NUEVO — Requerimiento 2)
+# 7. NUEVA SOLICITUD
 elif opcion_menu == "📝 Nueva Solicitud":
     st.subheader("Crear Nueva Solicitud de Compra")
     st.caption("Una vez enviada, la solicitud queda bloqueada para el Solicitante: cualquier cambio "
                "(cantidades, ítems, cancelación) debe canalizarse a través de Compras (ver 'Control de Compras').")
 
-    # --- NUEVO: Control de presupuesto disponible (bloqueante en el punto de creación) ---
-    # El selector de área va FUERA del st.form para que el saldo se recalcule al
-    # instante al cambiar de área (dentro de un form, Streamlit no re-renderiza
-    # hasta el submit).
     df_areas_presu = pd.read_sql_query("SELECT DISTINCT area_name FROM presupuestos_area", get_engine())
     df_areas_emails = pd.read_sql_query("SELECT DISTINCT area_name FROM areas_emails", get_engine())
     areas_disponibles = sorted(set(df_areas_presu['area_name'].dropna().tolist()) | set(df_areas_emails['area_name'].dropna().tolist()))
@@ -1297,20 +1340,25 @@ elif opcion_menu == "📝 Nueva Solicitud":
     else:
         area_sol = st.selectbox("Área / Centro de Costo", areas_disponibles, key="area_sol_select")
         saldo_area = obtener_saldo_disponible(area_sol)
-        # NOTA MVP: acá solo se valida "¿el área tiene saldo > 0?", porque todavía
-        # no existe cotización ni monto exacto del pedido (eso se sabe recién en
-        # el Cuadro Comparativo, donde se hace el chequeo fino por monto real).
         if saldo_area > 0:
             st.success(f"💰 Saldo disponible para '{area_sol}': USD {saldo_area:,.2f}")
         else:
             st.error(f"⚠️ El área '{area_sol}' no tiene saldo disponible (USD {saldo_area:,.2f}). "
                      "No podrá enviar la solicitud hasta que Administración cargue presupuesto para esta área.")
 
+    # NUEVO (este fix): el selector de ítem va FUERA del form (igual que el área)
+    # para poder mostrar la descripción del ítem en cuanto se elige, sin
+    # esperar al submit del formulario.
+    item_sol, df_items_cat_sol = selector_item("Ítem a solicitar", key="item_sol_select")
+    if item_sol:
+        fila_item = df_items_cat_sol[df_items_cat_sol['codigo'] == item_sol].iloc[0]
+        desc_mostrar = fila_item['descripcion_estandar'] or "(sin descripción cargada)"
+        unidad_mostrar = fila_item['unidad_medida'] or "-"
+        st.info(f"📦 **{fila_item['nombre']}**\n\n{desc_mostrar}  \nUnidad de medida: {unidad_mostrar}")
+
     with st.form("form_nueva_solicitud"):
-        items_disponibles = pd.read_sql_query("SELECT codigo, descripcion_estandar FROM items", get_engine())
-        item_sol = st.selectbox("Ítem", items_disponibles['codigo'].tolist() if not items_disponibles.empty else [])
         cantidad_sol = st.number_input("Cantidad solicitada", min_value=1, value=1)
-        narrativa_sol = st.text_area("Descripción / narrativa de la necesidad")
+        narrativa_sol = st.text_area("Descripción / narrativa de la necesidad (detalle adicional para esta solicitud puntual)")
 
         if st.form_submit_button("📨 Enviar Solicitud"):
             if not area_sol:
@@ -1322,14 +1370,7 @@ elif opcion_menu == "📝 Nueva Solicitud":
             else:
                 with get_db_connection() as conn:
                     with conn.cursor() as cursor:
-                        # NUEVO (recomendado): numeración automática de solicitudes
-                        cursor.execute("SELECT req_code FROM requisitions ORDER BY req_code DESC LIMIT 1")
-                        ultimo = cursor.fetchone()
-                        try:
-                            siguiente_num = int(ultimo[0]) + 1 if ultimo and str(ultimo[0]).isdigit() else 100000
-                        except (ValueError, TypeError):
-                            siguiente_num = 100000
-                        nuevo_req_code = str(siguiente_num)
+                        nuevo_req_code = generar_siguiente_req_code(cursor)
 
                         cursor.execute("""
                             INSERT INTO requisitions (req_code, situacao_solici, pedido, data_solicita, analista_email, area_name)
@@ -1350,23 +1391,90 @@ elif opcion_menu == "📝 Nueva Solicitud":
                         registrar_notificacion(cursor, nuevo_req_code, 'solicitud_creada',
                                                 f"Nueva solicitud {nuevo_req_code} creada por {st.session_state.user_email}")
                 st.success(f"✅ Solicitud creada con el código **{nuevo_req_code}**. Ya no puede modificarla desde aquí.")
+                st.rerun()
 
-# 8. CONTROL DE COMPRAS (NUEVO — Requerimiento 3, 4, 5, 9 y recepción/fechas)
+    # NUEVO (este fix): "Mis Solicitudes" — cada solicitante ve SOLO las
+    # requisiciones que él mismo creó (analista_email = su propio email),
+    # no las de otras personas. Es de solo lectura: la modificación sigue
+    # reservada a Compras (Control de Compras).
+    st.markdown("---")
+    st.subheader("📄 Mis Solicitudes Creadas")
+    df_mis_reqs = pd.read_sql_query("""
+        SELECT req_code AS "N° Requisición", situacao_solici AS "Estado",
+               area_name AS "Área", aprobador_actual AS "Aprobador Actual",
+               secuencia_aprobacion_actual AS "Nivel de Aprobación", pedido AS "N° Orden de Compra"
+        FROM requisitions WHERE analista_email = %(email)s ORDER BY req_code DESC
+    """, get_engine(), params={"email": st.session_state.user_email})
+
+    if df_mis_reqs.empty:
+        st.caption("Todavía no ha creado ninguna solicitud.")
+    else:
+        st.dataframe(df_mis_reqs, use_container_width=True)
+        req_mia_detalle = st.selectbox(
+            "Ver contenido (ítems) de:",
+            df_mis_reqs["N° Requisición"].tolist(),
+            key="mis_reqs_detalle_select"
+        )
+        df_detalle_mia = pd.read_sql_query("""
+            SELECT d.item_codigo AS "Código", COALESCE(i.nombre,'(sin nombre)') AS "Nombre del Ítem",
+                   d.narrativa_solicitante AS "Descripción/Narrativa",
+                   d.cantidad_solicitada AS "Cant. Solicitada", d.cantidad_comprador AS "Cant. Autorizada por Compras"
+            FROM requisitions_detalles d LEFT JOIN items i ON d.item_codigo = i.codigo
+            WHERE d.requisicion_id = %(req)s
+        """, get_engine(), params={"req": req_mia_detalle})
+        st.dataframe(df_detalle_mia, use_container_width=True)
+
+# 8. CONTROL DE COMPRAS
 elif opcion_menu == "🛠️ Control de Compras":
     st.subheader("Control Exclusivo de Compras sobre Requisiciones")
-    ctrl_req_code = st.text_input("Código de Requisición a intervenir", "14660", key="ctrl_req")
+
+    # NUEVO (este fix): en vez de un campo de texto libre "a ciegas" (que
+    # obligaba a saber de memoria el código), ahora se ve la lista completa
+    # de requisiciones existentes, con buscador, y se elige de un selectbox.
+    buscar_ctrl = st.text_input(
+        "🔍 Buscar requisición por código, área o estado",
+        key="buscar_ctrl_req",
+        placeholder="Ej: 14660, Mantenimiento, Pendiente..."
+    )
+    query_reqs_ctrl = """
+        SELECT req_code, situacao_solici, area_name, analista_email, aprobador_actual,
+               secuencia_aprobacion_actual, pedido
+        FROM requisitions
+    """
+    if buscar_ctrl:
+        df_reqs_ctrl = pd.read_sql_query(
+            query_reqs_ctrl + " WHERE req_code ILIKE %(t)s OR area_name ILIKE %(t)s OR situacao_solici ILIKE %(t)s ORDER BY req_code DESC",
+            get_engine(), params={"t": f"%{buscar_ctrl}%"}
+        )
+    else:
+        df_reqs_ctrl = pd.read_sql_query(query_reqs_ctrl + " ORDER BY req_code DESC", get_engine())
+
+    if df_reqs_ctrl.empty:
+        st.warning("No hay requisiciones cargadas en el sistema todavía (o ninguna coincide con la búsqueda).")
+        st.stop()
+
+    st.dataframe(df_reqs_ctrl, use_container_width=True)
+
+    ctrl_req_code = st.selectbox(
+        "Código de Requisición a intervenir",
+        df_reqs_ctrl['req_code'].tolist(),
+        key="ctrl_req"
+    )
 
     tab_items, tab_prov_resp, tab_empresa, tab_estado, tab_consolida, tab_docs, tab_recepcion = st.tabs([
         "📦 Ítems", "🤝 Proveedor / Responsable", "🏦 Empresa Compradora",
         "🔄 Estado", "🔀 Consolidar / Dividir OC", "📎 Documentos", "📥 Recepción"
     ])
 
-    # --- Req. 3: eliminar / agregar / sustituir / modificar especificaciones ---
     with tab_items:
-        df_det_ctrl = pd.read_sql_query(
-            "SELECT id, item_codigo, narrativa_solicitante, cantidad_solicitada, cantidad_comprador FROM requisitions_detalles WHERE requisicion_id = %(req)s",
-            get_engine(), params={"req": ctrl_req_code}
-        )
+        # NUEVO (este fix): se hace JOIN con items para mostrar el nombre
+        # del ítem, no solo el código.
+        df_det_ctrl = pd.read_sql_query("""
+            SELECT d.id, d.item_codigo, COALESCE(i.nombre,'(sin nombre)') AS item_nombre,
+                   d.narrativa_solicitante, d.cantidad_solicitada, d.cantidad_comprador
+            FROM requisitions_detalles d LEFT JOIN items i ON d.item_codigo = i.codigo
+            WHERE d.requisicion_id = %(req)s
+        """, get_engine(), params={"req": ctrl_req_code})
         st.dataframe(df_det_ctrl, use_container_width=True)
 
         accion_item = st.selectbox("Acción sobre ítems", [
@@ -1374,14 +1482,15 @@ elif opcion_menu == "🛠️ Control de Compras":
         ])
 
         if accion_item == "Agregar ítem adicional":
+            nuevo_codigo, _ = selector_item("Ítem del catálogo a agregar", key="agregar_item_sel")
             with st.form("form_agregar_item"):
-                df_catalogo = pd.read_sql_query("SELECT codigo, descripcion_estandar FROM items", get_engine())
-                nuevo_codigo = st.selectbox("Ítem del catálogo", df_catalogo['codigo'].tolist() if not df_catalogo.empty else [])
                 nueva_cant = st.number_input("Cantidad", min_value=1, value=1)
                 motivo_add = st.text_area("Motivo de la adición (obligatorio)")
                 if st.form_submit_button("➕ Agregar Ítem"):
                     if not motivo_add.strip():
                         st.error("Debe indicar un motivo.")
+                    elif not nuevo_codigo:
+                        st.error("Debe seleccionar un ítem del catálogo.")
                     else:
                         with get_db_connection() as conn:
                             with conn.cursor() as cursor:
@@ -1399,7 +1508,10 @@ elif opcion_menu == "🛠️ Control de Compras":
         elif accion_item == "Eliminar ítem":
             if not df_det_ctrl.empty:
                 with st.form("form_eliminar_item"):
-                    id_a_borrar = st.selectbox("Línea a eliminar (ID)", df_det_ctrl['id'].tolist())
+                    id_a_borrar = st.selectbox(
+                        "Línea a eliminar (ID)", df_det_ctrl['id'].tolist(),
+                        format_func=lambda i: f"{i} — {df_det_ctrl[df_det_ctrl['id']==i].iloc[0]['item_nombre']}"
+                    )
                     motivo_del = st.text_area("Motivo de la eliminación (obligatorio)")
                     if st.form_submit_button("🗑️ Eliminar Ítem"):
                         if not motivo_del.strip():
@@ -1420,14 +1532,19 @@ elif opcion_menu == "🛠️ Control de Compras":
 
         elif accion_item == "Sustituir por equivalente":
             if not df_det_ctrl.empty:
+                id_a_sustituir = st.selectbox(
+                    "Línea a sustituir (ID)", df_det_ctrl['id'].tolist(),
+                    format_func=lambda i: f"{i} — {df_det_ctrl[df_det_ctrl['id']==i].iloc[0]['item_nombre']}",
+                    key="sustituir_id_sel"
+                )
+                nuevo_codigo_sust, _ = selector_item("Nuevo ítem equivalente", key="sustituir_item_sel")
                 with st.form("form_sustituir_item"):
-                    id_a_sustituir = st.selectbox("Línea a sustituir (ID)", df_det_ctrl['id'].tolist())
-                    df_catalogo2 = pd.read_sql_query("SELECT codigo, descripcion_estandar FROM items", get_engine())
-                    nuevo_codigo_sust = st.selectbox("Nuevo ítem equivalente", df_catalogo2['codigo'].tolist() if not df_catalogo2.empty else [])
                     motivo_sust = st.text_area("Motivo de la sustitución (obligatorio)")
                     if st.form_submit_button("🔁 Sustituir Ítem"):
                         if not motivo_sust.strip():
                             st.error("Debe indicar un motivo.")
+                        elif not nuevo_codigo_sust:
+                            st.error("Debe seleccionar el ítem equivalente.")
                         else:
                             codigo_anterior = df_det_ctrl[df_det_ctrl['id'] == id_a_sustituir].iloc[0]['item_codigo']
                             with get_db_connection() as conn:
@@ -1445,7 +1562,10 @@ elif opcion_menu == "🛠️ Control de Compras":
         elif accion_item == "Modificar especificaciones técnicas":
             if not df_det_ctrl.empty:
                 with st.form("form_modif_specs"):
-                    id_a_modif = st.selectbox("Línea a modificar (ID)", df_det_ctrl['id'].tolist())
+                    id_a_modif = st.selectbox(
+                        "Línea a modificar (ID)", df_det_ctrl['id'].tolist(),
+                        format_func=lambda i: f"{i} — {df_det_ctrl[df_det_ctrl['id']==i].iloc[0]['item_nombre']}"
+                    )
                     nueva_narrativa = st.text_area("Nueva especificación técnica / narrativa")
                     motivo_specs = st.text_area("Motivo del cambio (obligatorio)", key="motivo_specs")
                     if st.form_submit_button("✏️ Guardar Especificaciones"):
@@ -1465,7 +1585,6 @@ elif opcion_menu == "🛠️ Control de Compras":
             else:
                 st.info("No hay ítems para modificar.")
 
-    # --- Req. 3: cambiar proveedor asignado / reasignar responsable ---
     with tab_prov_resp:
         col_a, col_b = st.columns(2)
         with col_a:
@@ -1512,7 +1631,6 @@ elif opcion_menu == "🛠️ Control de Compras":
                         st.success("Responsable reasignado.")
                         st.rerun()
 
-    # --- Req. 4: Empresa Compradora + historial + control de presupuesto informativo ---
     with tab_empresa:
         df_empresas = pd.read_sql_query("SELECT ruc, razon_social FROM empresas_compradoras", get_engine())
         if df_empresas.empty:
@@ -1552,7 +1670,6 @@ elif opcion_menu == "🛠️ Control de Compras":
                 st.markdown("**Historial de cambios de empresa compradora**")
                 st.dataframe(df_hist_emp, use_container_width=True)
 
-            # NUEVO (recomendado): control de presupuesto disponible — informativo en esta iteración
             if area_actual:
                 df_presu = pd.read_sql_query(
                     "SELECT empresa_ruc, monto_asignado, monto_utilizado, periodo FROM presupuestos_area WHERE area_name = %(a)s ORDER BY periodo DESC",
@@ -1563,7 +1680,6 @@ elif opcion_menu == "🛠️ Control de Compras":
                     st.markdown("**💰 Presupuesto disponible para el área** (informativo — no bloquea la emisión de OC en esta versión)")
                     st.dataframe(df_presu, use_container_width=True)
 
-    # --- Req. 5: Estados del proceso ---
     with tab_estado:
         df_estado_actual = pd.read_sql_query("SELECT situacao_solici FROM requisitions WHERE req_code = %(req)s", get_engine(), params={"req": ctrl_req_code})
         estado_actual = df_estado_actual.iloc[0]['situacao_solici'] if not df_estado_actual.empty else "Sin datos"
@@ -1588,7 +1704,6 @@ elif opcion_menu == "🛠️ Control de Compras":
                     st.success("Estado actualizado y notificación registrada.")
                     st.rerun()
 
-    # --- Req. 3: consolidar varias solicitudes / dividir una solicitud ---
     with tab_consolida:
         st.markdown("**Consolidar varias solicitudes en una sola Orden de Compra**")
         todas_reqs = pd.read_sql_query("SELECT req_code FROM requisitions ORDER BY req_code", get_engine())
@@ -1614,14 +1729,16 @@ elif opcion_menu == "🛠️ Control de Compras":
 
         st.markdown("---")
         st.markdown("**Dividir una solicitud en varias Órdenes de Compra**")
-        df_det_dividir = pd.read_sql_query(
-            "SELECT id, item_codigo FROM requisitions_detalles WHERE requisicion_id = %(req)s",
-            get_engine(), params={"req": ctrl_req_code}
-        )
+        df_det_dividir = pd.read_sql_query("""
+            SELECT d.id, d.item_codigo, COALESCE(i.nombre,'(sin nombre)') AS item_nombre
+            FROM requisitions_detalles d LEFT JOIN items i ON d.item_codigo = i.codigo
+            WHERE d.requisicion_id = %(req)s
+        """, get_engine(), params={"req": ctrl_req_code})
         with st.form("form_dividir"):
             ids_grupo_2 = st.multiselect(
                 "Ítems (ID) que van a la NUEVA OC (el resto queda en la OC original)",
-                df_det_dividir['id'].tolist() if not df_det_dividir.empty else []
+                df_det_dividir['id'].tolist() if not df_det_dividir.empty else [],
+                format_func=lambda i: f"{i} — {df_det_dividir[df_det_dividir['id']==i].iloc[0]['item_nombre']}" if not df_det_dividir.empty else str(i)
             )
             nuevo_req_code_split = st.text_input("Código de la nueva requisición/OC derivada")
             motivo_div = st.text_area("Motivo de la división (obligatorio)", key="motivo_div")
@@ -1644,7 +1761,6 @@ elif opcion_menu == "🛠️ Control de Compras":
                     st.success(f"Ítems movidos a la nueva requisición/OC {nuevo_req_code_split}.")
                     st.rerun()
 
-    # --- Req. 9: Gestión documental (MVP: BYTEA en Postgres, no Supabase Storage) ---
     with tab_docs:
         st.caption("MVP: los documentos se guardan como metadata + contenido (BYTEA) directamente en la base de datos. "
                    "Si se prefiere Supabase Storage más adelante, se puede migrar sin cambiar esta interfaz.")
@@ -1669,7 +1785,6 @@ elif opcion_menu == "🛠️ Control de Compras":
         else:
             st.info("No hay documentos adjuntos para esta requisición.")
 
-    # --- Recomendado: fechas comprometidas + recepción parcial/completa ---
     with tab_recepcion:
         df_fecha = pd.read_sql_query("SELECT fecha_comprometida FROM requisitions WHERE req_code = %(req)s", get_engine(), params={"req": ctrl_req_code})
         fecha_actual = df_fecha.iloc[0]['fecha_comprometida'] if not df_fecha.empty else None
@@ -1685,14 +1800,19 @@ elif opcion_menu == "🛠️ Control de Compras":
 
         st.markdown("---")
         st.markdown("**Recepción de Ítems (parcial / completa)**")
-        df_det_recep = pd.read_sql_query(
-            "SELECT id, item_codigo, cantidad_comprador, cantidad_recibida, estado_recepcion FROM requisitions_detalles WHERE requisicion_id = %(req)s",
-            get_engine(), params={"req": ctrl_req_code}
-        )
+        df_det_recep = pd.read_sql_query("""
+            SELECT d.id, d.item_codigo, COALESCE(i.nombre,'(sin nombre)') AS item_nombre,
+                   d.cantidad_comprador, d.cantidad_recibida, d.estado_recepcion
+            FROM requisitions_detalles d LEFT JOIN items i ON d.item_codigo = i.codigo
+            WHERE d.requisicion_id = %(req)s
+        """, get_engine(), params={"req": ctrl_req_code})
         if not df_det_recep.empty:
             st.dataframe(df_det_recep, use_container_width=True)
             with st.form("form_recepcion"):
-                id_recep = st.selectbox("Línea a recepcionar (ID)", df_det_recep['id'].tolist())
+                id_recep = st.selectbox(
+                    "Línea a recepcionar (ID)", df_det_recep['id'].tolist(),
+                    format_func=lambda i: f"{i} — {df_det_recep[df_det_recep['id']==i].iloc[0]['item_nombre']}"
+                )
                 cantidad_recibida_input = st.number_input("Cantidad recibida (acumulada)", min_value=0, value=0)
                 if st.form_submit_button("📥 Registrar Recepción"):
                     fila = df_det_recep[df_det_recep['id'] == id_recep].iloc[0]
@@ -1718,7 +1838,51 @@ elif opcion_menu == "🛠️ Control de Compras":
         else:
             st.info("No hay ítems para recepcionar.")
 
-# 9. BUSCADOR RÁPIDO (NUEVO — Requerimiento 6, recomendado)
+# =========================================================
+# NUEVO (este fix): 9. REPORTES DE REQUISICIONES (solo lectura, para todos)
+# =========================================================
+elif opcion_menu == REPORTES_MENU:
+    st.subheader("Reporte General de Requisiciones")
+    st.caption("Vista de solo lectura disponible para todos los roles: aquí puede ver el número de cada "
+               "requisición, su contenido (ítems) y en qué nivel de aprobación se encuentra. "
+               "La modificación de estos datos está reservada exclusivamente al equipo de Compras, "
+               "desde la sección '🛠️ Control de Compras'.")
+
+    buscar_rep = st.text_input(
+        "🔍 Buscar por número de requisición, área o estado",
+        placeholder="Ej: 100001, Mantenimiento, Aprobada..."
+    )
+    query_rep = """
+        SELECT req_code AS "N° Requisición", situacao_solici AS "Estado", area_name AS "Área",
+               analista_email AS "Creado por", aprobador_actual AS "Aprobador Actual",
+               secuencia_aprobacion_actual AS "Nivel de Aprobación", pedido AS "N° Orden de Compra"
+        FROM requisitions
+    """
+    if buscar_rep:
+        df_rep = pd.read_sql_query(
+            query_rep + " WHERE req_code ILIKE %(t)s OR area_name ILIKE %(t)s OR situacao_solici ILIKE %(t)s ORDER BY req_code DESC",
+            get_engine(), params={"t": f"%{buscar_rep}%"}
+        )
+    else:
+        df_rep = pd.read_sql_query(query_rep + " ORDER BY req_code DESC", get_engine())
+
+    if df_rep.empty:
+        st.info("No hay requisiciones registradas (o ninguna coincide con la búsqueda).")
+    else:
+        st.dataframe(df_rep, use_container_width=True)
+        st.markdown("---")
+        req_ver_detalle = st.selectbox("Ver contenido (ítems) de la requisición:", df_rep["N° Requisición"].tolist())
+        df_items_rep = pd.read_sql_query("""
+            SELECT d.item_codigo AS "Código", COALESCE(i.nombre,'(sin nombre)') AS "Nombre del Ítem",
+                   d.narrativa_solicitante AS "Descripción/Narrativa",
+                   d.cantidad_solicitada AS "Cant. Solicitada", d.cantidad_comprador AS "Cant. Autorizada",
+                   d.cantidad_recibida AS "Cant. Recibida", d.estado_recepcion AS "Estado de Recepción"
+            FROM requisitions_detalles d LEFT JOIN items i ON d.item_codigo = i.codigo
+            WHERE d.requisicion_id = %(req)s
+        """, get_engine(), params={"req": req_ver_detalle})
+        st.dataframe(df_items_rep, use_container_width=True)
+
+# 10. BUSCADOR RÁPIDO
 elif opcion_menu == "🔍 Buscador Rápido":
     st.subheader("Buscador Rápido")
     termino = st.text_input("Buscar por número de solicitud, proveedor o producto")
@@ -1731,8 +1895,11 @@ elif opcion_menu == "🔍 Buscador Rápido":
             "SELECT ruc, name FROM providers WHERE name ILIKE %(t)s OR ruc ILIKE %(t)s",
             get_engine(), params={"t": f"%{termino}%"}
         )
+        # NUEVO (este fix): el buscador de productos ahora también busca
+        # (y muestra) por el campo "nombre", no solo por descripción/código.
         df_busq_item = pd.read_sql_query(
-            "SELECT codigo, descripcion_estandar FROM items WHERE descripcion_estandar ILIKE %(t)s OR codigo ILIKE %(t)s",
+            "SELECT codigo, COALESCE(nombre,'(sin nombre)') AS nombre, descripcion_estandar "
+            "FROM items WHERE nombre ILIKE %(t)s OR descripcion_estandar ILIKE %(t)s OR codigo ILIKE %(t)s",
             get_engine(), params={"t": f"%{termino}%"}
         )
         st.markdown("**Solicitudes**")
@@ -1744,7 +1911,7 @@ elif opcion_menu == "🔍 Buscador Rápido":
     else:
         st.caption("Ingrese un término de búsqueda para comenzar.")
 
-# 10. NOTIFICACIONES (NUEVO — Requerimiento 10, bitácora)
+# 11. NOTIFICACIONES
 elif opcion_menu == "🔔 Notificaciones":
     st.subheader("Bitácora de Notificaciones Pendientes / Generadas")
     st.caption("MVP: log de eventos en base de datos. No hay envío de email real configurado todavía.")
